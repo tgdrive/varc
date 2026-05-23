@@ -1,0 +1,29 @@
+:8080 {
+    route /media/* {
+        varc https://origin.example.com {
+            cache_dir /var/cache/caddy/varc
+            key {host}:{uri}
+            append_uri on
+            ignore_query off
+
+            block_size 1MiB
+            chunk_size 128MiB
+            chunk_streams 4
+            max_inflight_bytes 512MiB
+            read_ahead 16MiB
+            max_size 500GiB
+            max_age 168h
+            poll_interval 1m
+            shard_level 2
+
+            timeout 60s
+            probe_timeout 15s
+            dial_timeout 10s
+            response_header_timeout 30s
+            max_idle_conns 256
+
+            debug_headers on
+            admin_path /_varc
+        }
+    }
+}

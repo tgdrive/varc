@@ -1,0 +1,10 @@
+:8080 {
+    route /media/* {
+        varc https://origin.example.com {
+            cache_dir /var/cache/caddy/varc
+            cache_only on
+            pass_thru off
+            debug_headers on
+        }
+    }
+}

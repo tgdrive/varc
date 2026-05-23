@@ -1,0 +1,30 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":8080"],
+          "routes": [
+            {
+              "match": [{ "path": ["/media/*"] }],
+              "handle": [
+                {
+                  "handler": "varc",
+                  "upstream": "https://origin.example.com",
+                  "cache_dir": "/var/cache/caddy/varc",
+                  "key": "{http.request.host}:{http.request.uri}",
+                  "chunk_size": 134217728,
+                  "block_size": 1048576,
+                  "chunk_streams": 4,
+                  "read_ahead": 16777216,
+                  "cache_max_size": 536870912000,
+                  "debug_headers": true
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}
