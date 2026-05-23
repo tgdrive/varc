@@ -1,4 +1,4 @@
-package proxy
+package httpcache
 
 import (
 	"context"
@@ -20,15 +20,17 @@ type remoteFile struct {
 	headers http.Header
 	size    int64
 	modTime time.Time
+	etag    string
 	client  *http.Client
 }
 
-func newHTTPFile(url string, headers http.Header, size int64, modTime time.Time, client *http.Client) *remoteFile {
+func newHTTPFile(url string, headers http.Header, size int64, modTime time.Time, etag string, client *http.Client) *remoteFile {
 	return &remoteFile{
 		url:     url,
 		headers: headers,
 		size:    size,
 		modTime: modTime,
+		etag:    etag,
 		client:  client,
 	}
 }
@@ -41,6 +43,22 @@ func (f *remoteFile) String() string {
 // Size returns the file size, or -1 if unknown
 func (f *remoteFile) Size() int64 {
 	return f.size
+}
+
+// Fingerprint returns a stable validator for cache invalidation when upstream provides one.
+func (f *remoteFile) Fingerprint() string {
+	if f.etag != "" {
+		return f.etag
+	}
+	if !f.modTime.IsZero() || f.size >= 0 {
+		return fmt.Sprintf("%s:%d:%d", f.url, f.size, f.modTime.UnixNano())
+	}
+	return ""
+}
+
+// ModTime returns the upstream modification time, if known.
+func (f *remoteFile) ModTime(ctx context.Context) time.Time {
+	return f.modTime
 }
 
 // Open opens the remote file for reading, supporting Range requests

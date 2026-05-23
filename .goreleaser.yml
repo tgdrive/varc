@@ -4,7 +4,7 @@ project_name: varc
 builds:
   - env:
       - CGO_ENABLED=0
-    main: main.go
+    main: ./cmd/varc
     binary: varc
     flags: -trimpath
     ldflags:

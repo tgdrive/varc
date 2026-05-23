@@ -119,21 +119,20 @@ var (
 	_ OsFiler = (*os.File)(nil)
 	_ Handle  = (*baseHandle)(nil)
 	_ Handle  = (*ReadFileHandle)(nil)
-	_ Handle  = (*WriteFileHandle)(nil)
 	_ Handle  = (*DirHandle)(nil)
 )
 
 // Engine represents the top level caching engine
 type Engine struct {
-	ctx         context.Context
-	root        *Dir
-	Opt         types.Options
-	cache       *cache.Cache
-	cancel      context.CancelFunc
-	usageMu     sync.Mutex
-	usageTime   time.Time
-	pollChan    chan time.Duration
-	inUse       atomic.Int32
+	ctx       context.Context
+	root      *Dir
+	Opt       types.Options
+	cache     *cache.Cache
+	cancel    context.CancelFunc
+	usageMu   sync.Mutex
+	usageTime time.Time
+	pollChan  chan time.Duration
+	inUse     atomic.Int32
 }
 
 // New creates a new Engine and root directory.

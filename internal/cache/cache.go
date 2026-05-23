@@ -14,9 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tgdrive/varc/lib/file"
-	"github.com/tgdrive/varc/internal/cache/writeback"
 	"github.com/tgdrive/varc/internal/types"
+	"github.com/tgdrive/varc/lib/file"
 )
 
 // NB as Cache and Item are tightly linked it is necessary to have a
@@ -25,36 +24,34 @@ import (
 //
 // Cache may call into Item but care is needed if Item calls Cache
 
-// FIXME need to purge cache nodes which don't have backing files and aren't dirty
-// these may get created by the proxy layer or may be orphans from reload()
+// FIXME need to purge cache nodes which don't have backing files.
+// These may be orphans from reload().
 
 // Cache opened files
 type Cache struct {
 	// read only - no locking needed to read these
-	ctx       context.Context       // context for cache lifetime
-	opt       *types.Options
-	root      string                // OS path for cache data
-	metaRoot  string                // OS path for cache metadata
-	writeback *writeback.WriteBack  // holds Items for writeback
-	avFn      AddVirtualFn          // if set, can be called to add dir entries
+	ctx      context.Context // context for cache lifetime
+	opt      *types.Options
+	root     string       // OS path for cache data
+	metaRoot string       // OS path for cache metadata
+	avFn     AddVirtualFn // if set, can be called to add dir entries
 
-	mu            sync.Mutex        // protects the following variables
-	cond          sync.Cond         // cond lock for synchronous cache cleaning
-	item          map[string]*Item  // files/directories in the cache
-	errItems      map[string]error  // items in error state
-	used          int64             // total size of files in the cache
-	outOfSpace    bool              // out of space
-	cleanerKicked bool              // some thread kicked the cleaner upon out of space
-	kickerMu      sync.Mutex        // mutex for cleanerKicked
-	kick          chan struct{}     // channel for kicking cleaner to start
+	mu            sync.Mutex       // protects the following variables
+	cond          sync.Cond        // cond lock for synchronous cache cleaning
+	item          map[string]*Item // files/directories in the cache
+	errItems      map[string]error // items in error state
+	used          int64            // total size of files in the cache
+	outOfSpace    bool             // out of space
+	cleanerKicked bool             // some thread kicked the cleaner upon out of space
+	kickerMu      sync.Mutex       // mutex for cleanerKicked
+	kick          chan struct{}    // channel for kicking cleaner to start
 }
 
 // AddVirtualFn if registered by the WithAddVirtual method, can be
 // called to register the object or directory at remote as a virtual
 // entry in directory listings.
 //
-// This is used when reloading the Cache and uploading items need to
-// go into the directory tree.
+// This is used when reloading the Cache and recovered items need to go into the directory tree.
 type AddVirtualFn func(remote string, size int64, isDir bool) error
 
 // New creates a new cache hierarchy
@@ -77,14 +74,13 @@ func New(ctx context.Context, opt *types.Options, avFn AddVirtualFn) (*Cache, er
 
 	// Create the cache object
 	c := &Cache{
-		ctx:       ctx,
-		opt:       opt,
-		root:      root,
-		metaRoot:  metaRoot,
-		item:      make(map[string]*Item),
-		errItems:  make(map[string]error),
-		writeback: writeback.New(ctx, opt),
-		avFn:      avFn,
+		ctx:      ctx,
+		opt:      opt,
+		root:     root,
+		metaRoot: metaRoot,
+		item:     make(map[string]*Item),
+		errItems: make(map[string]error),
+		avFn:     avFn,
 	}
 
 	// load in the cache and metadata off disk
@@ -112,10 +108,6 @@ func (c *Cache) Stats() map[string]interface{} {
 	out["root"] = c.root
 	out["metaRoot"] = c.metaRoot
 
-	uploadsInProgress, uploadsQueued := c.writeback.Stats()
-	out["uploadsInProgress"] = uploadsInProgress
-	out["uploadsQueued"] = uploadsQueued
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -125,21 +117,6 @@ func (c *Cache) Stats() map[string]interface{} {
 	out["outOfSpace"] = c.outOfSpace
 
 	return out
-}
-
-// Queue returns info about the Cache
-func (c *Cache) Queue() map[string]interface{} {
-	out := make(map[string]interface{})
-	out["queue"] = c.writeback.Queue()
-	return out
-}
-
-// QueueSetExpiry updates the expiry of a single item in the upload queue
-//
-// The expiry time is set to expiry + relative if expiry is passed in,
-// otherwise the expiry of the item is used.
-func (c *Cache) QueueSetExpiry(id writeback.Handle, expiry time.Time, relative time.Duration) error {
-	return c.writeback.SetExpiry(id, expiry, relative)
 }
 
 // createDir creates a directory path, along with any necessary parents
@@ -236,21 +213,6 @@ func (c *Cache) InUse(name string) bool {
 		return false
 	}
 	return item.inUse()
-}
-
-// DirtyItem returns the Item if it exists in the cache **and** is
-// dirty otherwise it returns nil.
-//
-// name should be a remote path not an osPath
-func (c *Cache) DirtyItem(name string) (item *Item) {
-	name = clean(name)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	item = c.item[name]
-	if item != nil && !item.IsDirty() {
-		item = nil
-	}
-	return item
 }
 
 // get gets a file name from the cache or creates a new one
@@ -389,10 +351,7 @@ func (c *Cache) DirRename(oldDirName string, newDirName string) (err error) {
 }
 
 // Remove should be called if name is deleted
-//
-// This returns true if the file was in the transfer queue so may not
-// have completely uploaded yet.
-func (c *Cache) Remove(name string) (wasWriting bool) {
+func (c *Cache) Remove(name string) {
 	name = clean(name)
 	c.mu.Lock()
 	item := c.item[name]
@@ -401,9 +360,9 @@ func (c *Cache) Remove(name string) (wasWriting bool) {
 	}
 	c.mu.Unlock()
 	if item == nil {
-		return false
+		return
 	}
-	return item.remove("file deleted")
+	item.remove("file deleted")
 }
 
 // SetModTime should be called to set the modification time of the cache file
@@ -502,7 +461,7 @@ func (c *Cache) KickCleaner() {
 func (c *Cache) removeNotInUse(item *Item, maxAge time.Duration, emptyOnly bool) {
 	removed, spaceFreed := item.RemoveNotInUse(maxAge, emptyOnly)
 	// The item space might be freed even if we get an error after the cache file is removed
-	// The item will not be removed or reset the cache data is dirty (DataDirty)
+	// The item will not be removed or reset while it is in use.
 	c.used -= spaceFreed
 	if removed {
 		c.opt.Logger.Infof("cache RemoveNotInUse (maxAge=%d, emptyOnly=%v): item %s was removed, freed %d bytes", maxAge, emptyOnly, item.GetName(), spaceFreed)
@@ -537,7 +496,7 @@ func (c *Cache) retryFailedResets() {
 	}
 }
 
-// Remove cache files that are not dirty until the quota is satisfied
+// Remove resettable cache files until the quota is satisfied.
 func (c *Cache) purgeClean() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -548,11 +507,9 @@ func (c *Cache) purgeClean() {
 
 	var items Items
 
-	// Make a slice of clean cache files
+	// Make a slice of cache files
 	for _, item := range c.item {
-		if !item.IsDirty() {
-			items = append(items, item)
-		}
+		items = append(items, item)
 	}
 
 	sort.Sort(items)
@@ -563,8 +520,7 @@ func (c *Cache) purgeClean() {
 			break
 		}
 		resetResult, spaceFreed, err := item.Reset()
-		// The item space might be freed even if we get an error after the cache file is removed
-		// The item will not be removed or reset if the cache data is dirty (DataDirty)
+		// The item space might be freed even if we get an error after the cache file is removed.
 		c.used -= spaceFreed
 		c.opt.Logger.Infof("cache purgeClean item.Reset %s: %s, freed %d bytes", item.GetName(), resetResult.String(), spaceFreed)
 		if resetResult == RemovedNotInUse {
@@ -739,7 +695,7 @@ func (c *Cache) clean(kicked bool) {
 		// Remove files not in use until cache size is below quota starting from the oldest first
 		c.purgeOverQuota()
 
-		// Remove cache files that are not dirty if we are still above the max cache size
+		// Reset cache files if we are still above the max cache size.
 		c.purgeClean()
 		c.retryFailedResets()
 	}
@@ -762,10 +718,8 @@ func (c *Cache) clean(kicked bool) {
 		}
 	}
 	c.mu.Unlock()
-	uploadsInProgress, uploadsQueued := c.writeback.Stats()
-
-	stats := fmt.Sprintf("objects %d (was %d) in use %d, to upload %d, uploading %d, total size %d (was %d)",
-		newItems, oldItems, totalInUse, uploadsQueued, uploadsInProgress, newUsed, oldUsed)
+	stats := fmt.Sprintf("objects %d (was %d) in use %d, total size %d (was %d)",
+		newItems, oldItems, totalInUse, newUsed, oldUsed)
 	c.opt.Logger.Infof("cache: cleaned: %s", stats)
 }
 

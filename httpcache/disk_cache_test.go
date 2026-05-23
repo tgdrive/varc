@@ -1,4 +1,4 @@
-package proxy
+package httpcache
 
 import (
 	"crypto/sha256"
@@ -102,7 +102,7 @@ func TestFullFileCachedOnDisk(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 2,
 		ShardLevel:        0,
@@ -195,7 +195,7 @@ func TestRangeCachedPartiallyOnDisk(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 1,
 		ShardLevel:        0,
@@ -268,7 +268,7 @@ func TestCacheHashMatches(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 4,
 		ShardLevel:        0,
@@ -343,7 +343,7 @@ func TestCacheReuseDataNoExtraGets(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 1,
 		ShardLevel:        0,
@@ -404,7 +404,7 @@ func TestCacheDirStructure(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 1,
 		ShardLevel:        0,

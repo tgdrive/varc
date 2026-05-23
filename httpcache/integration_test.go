@@ -1,4 +1,4 @@
-package proxy
+package httpcache
 
 import (
 	"fmt"
@@ -81,7 +81,7 @@ func TestProxyFullFileServe(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 1,
 		ShardLevel:        0,
@@ -116,7 +116,7 @@ func TestProxyRangeRequest(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 1,
 		ShardLevel:        0,
@@ -173,7 +173,7 @@ func TestProxyMultipleRanges(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 2,
 		ShardLevel:        0,
@@ -217,7 +217,7 @@ func TestProxyCacheReuse(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 4,
 		ShardLevel:        0,
@@ -253,7 +253,7 @@ func TestProxyCacheReuse(t *testing.T) {
 
 func TestProxyFileNotFound(t *testing.T) {
 	opt := Options{
-		CacheDir:          t.TempDir(),
+		CacheDir: t.TempDir(),
 
 		CacheChunkStreams: 1,
 		ShardLevel:        0,
@@ -311,7 +311,7 @@ func TestCacheCleanup(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 1,
 		ShardLevel:        0,
@@ -374,7 +374,6 @@ func TestOptionsNewHandler(t *testing.T) {
 		CacheDir:          cacheDir,
 		CacheChunkSize:    "4M",
 		CacheChunkStreams: 4,
-
 	}
 
 	handler, err := NewHandler(opt)
@@ -639,7 +638,7 @@ func TestConcurrentRangeRequests(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	opt := Options{
-		CacheDir:          cacheDir,
+		CacheDir: cacheDir,
 
 		CacheChunkStreams: 4,
 		ShardLevel:        0,

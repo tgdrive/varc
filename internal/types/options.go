@@ -6,14 +6,13 @@ const mebi = 1048576 // 1 MiB in bytes
 
 // Options is options for the cache engine
 type Options struct {
-	ChunkSize         int64         // if > 0 read files in chunks
-	ChunkSizeLimit    int64         // if > ChunkSize double the chunk size after each chunk until reached
-	ChunkStreams      int           // Number of download streams to use
+	ChunkSize         int64 // if > 0 read files in chunks
+	ChunkSizeLimit    int64 // if > ChunkSize double the chunk size after each chunk until reached
+	ChunkStreams      int   // Number of download streams to use
 	CacheMaxAge       time.Duration
 	CacheMaxSize      int64
 	CacheMinFreeSpace int64
 	CachePollInterval time.Duration
-	WriteBack         time.Duration // time to wait before writing back dirty files
 	ReadAhead         int64         // bytes to read ahead in cache mode "full"
 	FastFingerprint   bool          // if set use fast fingerprints
 	HandleCaching     time.Duration // time to keep handle alive after last close
@@ -31,7 +30,6 @@ var Opt = Options{
 	CacheMinFreeSpace: -1,
 	ChunkSize:         128 * mebi,
 	ChunkSizeLimit:    -1,
-	WriteBack:         5 * time.Second,
 	HandleCaching:     5 * time.Second,
 }
 

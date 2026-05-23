@@ -12,11 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tgdrive/varc/internal/cache/downloaders"
+	"github.com/tgdrive/varc/internal/types"
 	"github.com/tgdrive/varc/lib/file"
 	"github.com/tgdrive/varc/lib/ranges"
-	"github.com/tgdrive/varc/internal/cache/downloaders"
-	"github.com/tgdrive/varc/internal/cache/writeback"
-	"github.com/tgdrive/varc/internal/types"
 )
 
 // NB as Cache and Item are tightly linked it is necessary to have a
@@ -38,11 +37,6 @@ import (
 // be taken before Item.mu. downloader may call into Item but Item may
 // **not** call downloader methods with Item.mu held
 
-// NB Item and writeback are tightly linked so it is necessary to
-// have a total lock ordering between them. writeback.mu must always
-// be taken before Item.mu. writeback may call into Item but Item may
-// **not** call writeback methods with Item.mu held
-
 // LL Item reset is invoked by cache cleaner for synchronous recovery
 // from ENOSPC errors. The reset operation removes the cache file and
 // closes/reopens the downloaders.  Although most parts of reset and
@@ -61,12 +55,10 @@ type Item struct {
 	name            string                   // name in the cache
 	opens           int                      // number of times file is open
 	downloaders     *downloaders.Downloaders // a record of the downloaders in action - may be nil
-	o               types.RemoteObject   // object we are caching - may be nil
+	o               types.RemoteObject       // object we are caching - may be nil
 	fd              *os.File                 // handle we are using to read and write to the file
 	info            Info                     // info about the file to persist to backing store
-	writeBackID     writeback.Handle         // id of any writebacks in progress
 	pendingAccesses int                      // number of threads - cache reset not allowed if not zero
-	modified        bool                     // set if the file has been modified since the last Open
 	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
 	graceTimer      *time.Timer              // timer for delayed close after grace period
 }
@@ -78,7 +70,6 @@ type Info struct {
 	Size        int64         // size of the file
 	Rs          ranges.Ranges // which parts of the file are present
 	Fingerprint string        // fingerprint of remote object
-	Dirty       bool          // set if the backing file has been modified
 }
 
 // Items are a slice of *Item ordered by ATime
@@ -89,8 +80,7 @@ type ResetResult int
 
 // Constants used to report actual action taken in the Reset function and reason
 const (
-	SkippedDirty         ResetResult = iota // Dirty item cannot be reset
-	SkippedPendingAccess                    // Reset pending access can lead to deadlock
+	SkippedPendingAccess ResetResult = iota // Reset pending access can lead to deadlock
 	SkippedEmpty                            // Reset empty item does not save space
 	SkippedGrace                            // Item is in grace period, treat as in-use
 	RemovedNotInUse                         // Item not used. Remove instead of reset
@@ -99,7 +89,7 @@ const (
 )
 
 func (rr ResetResult) String() string {
-	return [...]string{"Dirty item skipped", "In-access item skipped", "Empty item skipped",
+	return [...]string{"In-access item skipped", "Empty item skipped",
 		"Grace period item skipped", "Not-in-use item removed", "Item reset failed", "Item reset completed"}[rr]
 }
 
@@ -125,9 +115,6 @@ func (info *Info) clean() {
 	info.ModTime = time.Now()
 	info.ATime = info.ModTime
 }
-
-// StoreFn is called back with an object after it has been uploaded
-type StoreFn func(types.RemoteObject)
 
 // newItem returns an item for the cache
 func newItem(c *Cache, name string) (item *Item) {
@@ -167,11 +154,11 @@ func newItem(c *Cache, name string) (item *Item) {
 	return item
 }
 
-// inUse returns true if the item is open or dirty
+// inUse returns true if the item is open.
 func (item *Item) inUse() bool {
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	return item.opens != 0 || item.info.Dirty
+	return item.opens != 0
 }
 
 // getDiskSize returns the size on disk (approximately) of the item
@@ -233,7 +220,7 @@ func (item *Item) _save() (err error) {
 
 // truncate the item to the given size, creating it if necessary
 //
-// this does not mark the object as dirty
+// this does not mark the item as locally modified
 //
 // call with the lock held
 func (item *Item) _truncate(size int64) (err error) {
@@ -257,8 +244,7 @@ func (item *Item) _truncate(size int64) (err error) {
 			// If the metadata has info but the file doesn't
 			// not exist then it has been externally removed
 			item.c.opt.Logger.Errorf("%s: cache: detected external removal of cache file", item.name)
-			item.info.Rs = nil      // show we have no blocks cached
-			item.info.Dirty = false // file can't be dirty if it doesn't exist
+			item.info.Rs = nil // show we have no blocks cached
 			item._removeMeta("cache file externally deleted")
 			fd, err = file.OpenFile(osPath, os.O_CREATE|os.O_WRONLY, 0600)
 		}
@@ -302,7 +288,7 @@ func (item *Item) _truncate(size int64) (err error) {
 
 // Truncate the item to the current size, creating if necessary
 //
-// This does not mark the object as dirty.
+// This does not mark the item as locally modified.
 //
 // call with the lock held
 func (item *Item) _truncateToCurrentSize() (err error) {
@@ -323,12 +309,9 @@ func (item *Item) _truncateToCurrentSize() (err error) {
 
 // Truncate the item to the given size, creating it if necessary
 //
-// If the new size is shorter than the existing size then the object
-// will be shortened and marked as dirty.
-//
-// If the new size is longer than the old size then the object will be
-// extended and the extended data will be filled with zeros. The
-// object will be marked as dirty in this case also.
+// If the new size is shorter than the existing size then the object will be shortened.
+// If the new size is longer than the old size then the object will be extended and the
+// extended data will be filled with zeros.
 func (item *Item) Truncate(size int64) (err error) {
 	item.preAccess()
 	defer item.postAccess()
@@ -366,7 +349,12 @@ func (item *Item) Truncate(size int64) (err error) {
 		changed = item.o == nil
 	}
 	if changed {
-		item._dirty()
+		item.info.ModTime = time.Now()
+		item.info.ATime = item.info.ModTime
+		err := item._save()
+		if err != nil {
+			item.c.opt.Logger.Errorf("%s: cache: failed to save item info: %v", item.name, err)
+		}
 	}
 
 	return nil
@@ -432,50 +420,12 @@ func (item *Item) Exists() bool {
 	return item._exists()
 }
 
-// _dirty marks the item as changed and needing writeback
-//
-// call with lock held
-func (item *Item) _dirty() {
-	item.info.ModTime = time.Now()
-	item.info.ATime = item.info.ModTime
-	if !item.modified {
-		item.modified = true
-		item.mu.Unlock()
-		item.c.writeback.Remove(item.writeBackID)
-		item.mu.Lock()
-	}
-	if !item.info.Dirty {
-		item.info.Dirty = true
-		err := item._save()
-		if err != nil {
-			item.c.opt.Logger.Errorf("%s: cache: failed to save item info: %v", item.name, err)
-		}
-	}
-}
-
-// Dirty marks the item as changed and needing writeback
-func (item *Item) Dirty() {
-	item.preAccess()
-	defer item.postAccess()
-	item.mu.Lock()
-	item._dirty()
-	item.mu.Unlock()
-}
-
-// IsDirty returns true if the item data is dirty
-func (item *Item) IsDirty() bool {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-	return item.info.Dirty
-}
-
 // Create the cache file and store the metadata on disk
 // Called with item.mu locked
 func (item *Item) _createFile(osPath string) (err error) {
 	if item.fd != nil {
 		return errors.New("cache item: internal error: didn't Close file")
 	}
-	item.modified = false
 	// t0 := time.Now()
 	fd, err := file.OpenFile(osPath, os.O_RDWR, 0600)
 	// item.c.opt.Logger.Debugf("%s: OpenFile took %v", item.name, time.Since(t0))
@@ -502,9 +452,6 @@ func (item *Item) _createFile(osPath string) (err error) {
 
 // ErrorObjectNotFound is returned when an object is not found on the remote
 var ErrorObjectNotFound = errors.New("object not found")
-
-// ErrorCantUploadEmptyFiles is returned when trying to upload an empty file to a backend that doesn't support it
-var ErrorCantUploadEmptyFiles = errors.New("can't upload empty files")
 
 // Open the local file from the object passed in.  Wraps open()
 // to provide recovery from out of space error.
@@ -617,49 +564,11 @@ func (item *Item) open(o types.RemoteObject) (err error) {
 // Calls f with mu unlocked, re-locking mu if a panic is raised
 //
 // mu must be locked when calling this function
-func unlockMutexForCall(mu *sync.Mutex, f func()) {
-	mu.Unlock()
-	defer mu.Lock()
-	f()
-}
-
-// Store stores the local cache file to the remote object, returning
-// the new remote object. objOld is the old object if known.
-//
-// Call with lock held
-//
-// In our fork, writes stay in local cache — no remote writeback.
-func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
-	// defer log.Trace(item.name, "item=%p", item)("err=%v", &err)
-
-	if !item.info.Dirty {
-		return nil
-	}
-
-	// In our fork, writes stay in local cache — no remote writeback
-	item.info.Dirty = false
-	err = item._save()
-	if err != nil {
-		item.c.opt.Logger.Errorf("%s: cache: failed to write metadata file: %v", item.name, err)
-	}
-
-	return nil
-}
-
-// Store stores the local cache file to the remote object, returning
-// the new remote object. objOld is the old object if known.
-func (item *Item) store(ctx context.Context, storeFn StoreFn) (err error) {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-	return item._store(ctx, storeFn)
-}
-
 // Close the cache file
-func (item *Item) Close(storeFn StoreFn) (err error) {
+func (item *Item) Close() (err error) {
 	// defer log.Trace(item.o, "Item.Close")("err=%v", &err)
 	item.preAccess()
 	defer item.postAccess()
-	syncWriteBack := item.c.opt.WriteBack <= 0
 	item.mu.Lock()
 	defer item.mu.Unlock()
 
@@ -672,21 +581,17 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 		return nil
 	}
 
-	// opens == 0: check for grace period (only for non-dirty files,
-	// dirty files need immediate close so writeback can proceed)
+	// opens == 0: check for grace period.
 	gracePeriod := time.Duration(item.c.opt.HandleCaching)
-	if gracePeriod > 0 && !item.info.Dirty {
+	if gracePeriod > 0 {
 		item.graceTimer = time.AfterFunc(gracePeriod, item.closeAfterGrace)
 		return nil
 	}
 
-	return item._actualClose(storeFn, syncWriteBack)
+	return item._actualClose()
 }
 
 // closeAfterGrace is called by the grace timer to perform the actual close.
-//
-// Grace period only applies to non-dirty files, so storeFn (only
-// needed for writeback) and syncWriteBack are not relevant.
 func (item *Item) closeAfterGrace() {
 	item.mu.Lock()
 	defer item.mu.Unlock()
@@ -698,7 +603,7 @@ func (item *Item) closeAfterGrace() {
 	}
 	item.graceTimer = nil
 
-	err := item._actualClose(nil, false)
+	err := item._actualClose()
 	if err != nil {
 		item.c.opt.Logger.Errorf("%s: cache: close after grace period failed: %v", item.name, err)
 	}
@@ -707,24 +612,11 @@ func (item *Item) closeAfterGrace() {
 // _actualClose performs the actual close operations on the item.
 //
 // Call with item.mu held. May temporarily unlock item.mu.
-func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) {
+func (item *Item) _actualClose() (err error) {
 	var dls *downloaders.Downloaders
 
 	// Update the size on close
 	_, _ = item._getSize()
-
-	// If the file is dirty ensure any segments not transferred
-	// are brought in first.
-	//
-	// FIXME It would be nice to do this asynchronously however it
-	// would require keeping the downloaders alive after the item
-	// has been closed
-	if item.info.Dirty && item.o != nil {
-		err = item._ensure(0, item.info.Size)
-		if err != nil {
-			return fmt.Errorf("cache: failed to download missing parts of cache file: %w", err)
-		}
-	}
 
 	// Accumulate and log errors
 	checkErr := func(e error) {
@@ -759,71 +651,32 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
 		item.fd = nil
 	}
 
-	// save the metadata once more since it may be dirty
-	// after the downloader
+	// save the metadata once more since it may have been updated by the downloader
 	checkErr(item._save())
 
 	// if the item hasn't been changed but has been completed then
 	// set the modtime from the object otherwise set it from the info
 	if item._exists() {
-		if !item.info.Dirty && item.o != nil {
-			var roModTime time.Time
+		if item.o != nil {
 			if mt, ok := item.o.(modTimer); ok {
-				roModTime = mt.ModTime(item.c.ctx)
+				if roModTime := mt.ModTime(item.c.ctx); !roModTime.IsZero() {
+					item._setModTime(roModTime)
+				} else {
+					item._setModTime(item.info.ModTime)
+				}
+			} else {
+				item._setModTime(item.info.ModTime)
 			}
-			item._setModTime(roModTime)
 		} else {
 			item._setModTime(item.info.ModTime)
 		}
 	}
 
-	// upload the file to backing store if changed
-	if item.info.Dirty {
-		item.c.opt.Logger.Infof("%s: cache: queuing for upload in %v", item.name, item.c.opt.WriteBack)
-		if syncWriteBack {
-			// do synchronous writeback
-			checkErr(item._store(item.c.ctx, storeFn))
-		} else {
-			// asynchronous writeback
-			item.c.writeback.SetID(&item.writeBackID)
-			id := item.writeBackID
-			item.mu.Unlock()
-			item.c.writeback.Add(id, item.name, item.info.Size, item.modified, func(ctx context.Context) error {
-				return item.store(ctx, storeFn)
-			})
-			item.mu.Lock()
-		}
-	}
-
-	// mark as not modified now we have uploaded or queued for upload
-	item.modified = false
-
 	return err
 }
 
 // reload is called with valid items recovered from a cache reload.
-//
-// If they are dirty then it makes sure they get uploaded.
-//
-// it is called before the cache has started so opens will be 0 and
-// metaDirty will be false.
 func (item *Item) reload(ctx context.Context) error {
-	item.mu.Lock()
-	dirty := item.info.Dirty
-	item.mu.Unlock()
-	if !dirty {
-		return nil
-	}
-	// In our fork, there is no remote object to check; open with nil
-	err := item.Open(nil)
-	if err != nil {
-		return err
-	}
-	// close the file to execute the writeback if needed
-	err = item.Close(nil)
-	if err != nil {
-		return err
-	}
 	// put the file into the directory listings
 	size, err := item._getSize()
 	if err != nil {
@@ -839,39 +692,25 @@ func (item *Item) reload(ctx context.Context) error {
 // check the fingerprint of an object and update the item or delete
 // the cached file accordingly
 //
-// If we have local modifications then they take precedence
-// over a change in the remote
-//
 // It ensures the file is the correct size for the object.
 //
 // call with lock held
 func (item *Item) _checkObject(o types.RemoteObject) error {
 	if o == nil {
-		if item.info.Fingerprint != "" {
-			// no remote object && local object
-			// remove local object unless dirty
-			if !item.info.Dirty {
-				item._remove("stale (remote deleted)")
-			} else {
-				item.c.opt.Logger.Debugf("%s: cache: remote object has gone but local object modified - keeping it", item.name)
-			}
-			//} else {
-			// no remote object && no local object
-			// OK
-		}
+		// Varc uses nil remote objects for cache-only/stale reads. Unlike rclone VFS,
+		// nil does not mean the remote object was deleted, so keep existing cache data.
 	} else {
 		remoteFingerprint := _fingerprint(o, item.c.opt.FastFingerprint)
 		item.c.opt.Logger.Debugf("%s: cache: checking remote fingerprint %q against cached fingerprint %q", item.name, remoteFingerprint, item.info.Fingerprint)
-		if item.info.Fingerprint != "" {
+		if remoteFingerprint == "" {
+			// Source has no validator. Keep existing cached data rather than
+			// repeatedly invalidating entries whose previous source had one.
+		} else if item.info.Fingerprint != "" {
 			// remote object && local object
 			if remoteFingerprint != item.info.Fingerprint {
-				if !item.info.Dirty {
-					item.c.opt.Logger.Debugf("%s: cache: removing cached entry as stale (remote fingerprint %q != cached fingerprint %q)", item.name, remoteFingerprint, item.info.Fingerprint)
-					item._remove("stale (remote is different)")
-					item.info.Fingerprint = remoteFingerprint
-				} else {
-					item.c.opt.Logger.Debugf("%s: cache: remote object has changed but local object modified - keeping it (remote fingerprint %q != cached fingerprint %q)", item.name, remoteFingerprint, item.info.Fingerprint)
-				}
+				item.c.opt.Logger.Debugf("%s: cache: removing cached entry as stale (remote fingerprint %q != cached fingerprint %q)", item.name, remoteFingerprint, item.info.Fingerprint)
+				item._remove("stale (remote is different)")
+				item.info.Fingerprint = remoteFingerprint
 			}
 		} else {
 			// remote object && no local object
@@ -928,30 +767,18 @@ func (item *Item) _removeMeta(reason string) {
 }
 
 // remove the cached file and empty the metadata
-//
-// This returns true if the file was in the transfer queue so may not
-// have completely uploaded yet.
-//
 // call with lock held
-func (item *Item) _remove(reason string) (wasWriting bool) {
-	// Cancel writeback, if any
-	item.mu.Unlock()
-	wasWriting = item.c.writeback.Remove(item.writeBackID)
-	item.mu.Lock()
+func (item *Item) _remove(reason string) {
 	item.info.clean()
 	item._removeFile(reason)
 	item._removeMeta(reason)
-	return wasWriting
 }
 
 // remove the cached file and empty the metadata
-//
-// This returns true if the file was in the transfer queue so may not
-// have completely uploaded yet.
-func (item *Item) remove(reason string) (wasWriting bool) {
+func (item *Item) remove(reason string) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	return item._remove(reason)
+	item._remove(reason)
 }
 
 // RemoveNotInUse is called to remove cache file that has not been accessed recently
@@ -963,7 +790,7 @@ func (item *Item) RemoveNotInUse(maxAge time.Duration, emptyOnly bool) (removed 
 	spaceFreed = 0
 	removed = false
 
-	if item.opens != 0 || item.info.Dirty || item.graceTimer != nil {
+	if item.opens != 0 || item.graceTimer != nil {
 		return
 	}
 
@@ -984,16 +811,14 @@ func (item *Item) RemoveNotInUse(maxAge time.Duration, emptyOnly bool) (removed 
 		if !emptyOnly || spaceUsed == 0 {
 			spaceFreed = spaceUsed
 			removed = true
-			if item._remove("Removing old cache file not in use") {
-				item.c.opt.Logger.Errorf("%s: item removed when it was writing/uploaded", item.name)
-			}
+			item._remove("Removing old cache file not in use")
 		}
 	}
 	return
 }
 
-// Reset is called by the cache purge functions only to reset (empty the contents) cache files that
-// are not dirty.  It is used when cache space runs out and we see some ENOSPC error.
+// Reset is called by the cache purge functions to reset (empty the contents) cache files.
+// It is used when cache space runs out and we see some ENOSPC error.
 func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
@@ -1001,17 +826,10 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 	// The item is not being used now.  Just remove it instead of resetting it.
 	// Items in their grace period are treated as in-use; the cache
 	// cleaner will pick them up on the next pass.
-	if item.opens == 0 && !item.info.Dirty && item.graceTimer == nil {
+	if item.opens == 0 && item.graceTimer == nil {
 		spaceFreed = item.info.Rs.Size()
-		if item._remove("Removing old cache file not in use") {
-			item.c.opt.Logger.Errorf("%s: item removed when it was writing/uploaded", item.name)
-		}
+		item._remove("Removing old cache file not in use")
 		return RemovedNotInUse, spaceFreed, nil
-	}
-
-	// do not reset dirty file
-	if item.info.Dirty {
-		return SkippedDirty, 0, nil
 	}
 
 	// Items in their grace period are treated as in-use; the cache
@@ -1087,12 +905,8 @@ func (item *Item) Reset() (rr ResetResult, spaceFreed int64, err error) {
 
 	spaceFreed = item.info.Rs.Size()
 
-	// This should not be possible.  We get here only if cache data is not dirty.
-	if item._remove("cache out of space, item is clean") {
-		item.c.opt.Logger.Errorf("%s: cache item removed when it was writing/uploaded", item.o)
-	}
+	item._remove("cache out of space")
 
-	// can we have an item with no dirty data (so that we can get here) and nil item.o at the same time?
 	fso := item.o
 	checkErr(item._checkObject(fso))
 	if err != nil {
@@ -1229,12 +1043,7 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 
 // _written marks the (offset, size) as present in the backing file
 //
-// This is called by the downloader downloading file segments and the
-// proxy layer writing to the file.
-//
-// This doesn't mark the item as Dirty - that the responsibility
-// of the caller as we don't know here whether we are adding reads or
-// writes to the cache file.
+// This is called by the downloader downloading file segments.
 //
 // call with lock held
 func (item *Item) _written(offset, size int64) {
@@ -1359,7 +1168,7 @@ func (item *Item) readAt(b []byte, off int64) (n int, err error) {
 	}
 
 	// Check to see if object has shrunk - if so don't read too much.
-	if item.o != nil && !item.info.Dirty && item.o.Size() != item.info.Size {
+	if item.o != nil && item.o.Size() != item.info.Size {
 		item.c.opt.Logger.Debugf("%s: Size has changed from %d to %d", item.o, item.info.Size, item.o.Size())
 		err = item._truncate(item.o.Size())
 		if err != nil {
@@ -1370,42 +1179,6 @@ func (item *Item) readAt(b []byte, off int64) (n int, err error) {
 	item.info.ATime = time.Now()
 	// Do the reading with Item.mu unlocked and cache protected by preAccess
 	n, err = item.fd.ReadAt(b, off)
-	return n, err
-}
-
-// WriteAt bytes to the file at off
-func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
-	item.preAccess()
-	defer item.postAccess()
-	item.mu.Lock()
-	if item.fd == nil {
-		item.mu.Unlock()
-		return 0, errors.New("cache item WriteAt: internal error: didn't Open file")
-	}
-	item.mu.Unlock()
-	// Do the writing with Item.mu unlocked
-	n, err = item.fd.WriteAt(b, off)
-	if err == nil && n != len(b) {
-		err = fmt.Errorf("short write: tried to write %d but only %d written", len(b), n)
-	}
-	item.mu.Lock()
-	item._written(off, int64(n))
-	if n > 0 {
-		item._dirty()
-	}
-	end := off + int64(n)
-	// Writing off the end of the file so need to make some
-	// zeroes.  we do this by showing that we have written to the
-	// new parts of the file.
-	if off > item.info.Size {
-		item._written(item.info.Size, off-item.info.Size)
-		item._dirty()
-	}
-	// Update size
-	if end > item.info.Size {
-		item.info.Size = end
-	}
-	item.mu.Unlock()
 	return n, err
 }
 
@@ -1496,9 +1269,6 @@ func (item *Item) rename(name string, newName string, newObj types.RemoteObject)
 	downloaders := item.downloaders
 	item.downloaders = nil
 
-	// id for writeback cancel
-	id := item.writeBackID
-
 	// Set internal state
 	item.name = newName
 	item.o = newObj
@@ -1515,11 +1285,10 @@ func (item *Item) rename(name string, newName string, newObj types.RemoteObject)
 
 	item.mu.Unlock()
 
-	// close downloader and cancel writebacks with mutex unlocked
+	// close downloader with mutex unlocked
 	if downloaders != nil {
 		_ = downloaders.Close(nil)
 	}
-	item.c.writeback.Rename(id, newName)
 	return err
 }
 

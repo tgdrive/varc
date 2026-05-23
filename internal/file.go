@@ -16,7 +16,7 @@ type File struct {
 	size  atomic.Int64    // size of file
 	ctx   context.Context // context for engine operations - read only
 
-	muRW sync.Mutex // synchronize RWFileHandle.openPending(), RWFileHandle.close() and File.Remove
+	muRW sync.Mutex // reserved for operations that must not race with File.Remove
 
 	mu   sync.RWMutex // protects the following
 	d    *Dir         // parent directory
@@ -66,7 +66,18 @@ func (f *File) ModTime() time.Time {
 }
 
 func (f *File) modTime() time.Time {
-	return time.Now()
+	if f.d == nil || f.d.engine == nil {
+		return time.Time{}
+	}
+	item := f.d.engine.CacheItem(f.Path())
+	if item == nil {
+		return time.Time{}
+	}
+	modTime, err := item.GetModTime()
+	if err != nil {
+		return time.Time{}
+	}
+	return modTime
 }
 
 // Size returns the size of the file

@@ -17,7 +17,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 
-	"github.com/tgdrive/varc/pkg/proxy"
+	"github.com/tgdrive/varc/httpcache"
 )
 
 func init() {
@@ -38,9 +38,9 @@ type Handler struct {
 	// Example: "/varc/metrics"
 	MetricsPath string `json:"metrics_path,omitempty"`
 
-	proxy.Options
+	httpcache.Options
 
-	handler     *proxy.Handler
+	handler     *httpcache.Handler
 	logger      *zap.Logger
 	upstreamURL *url.URL
 }
@@ -48,10 +48,10 @@ type Handler struct {
 // CaddyModule returns the Caddy module information.
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.varc",
+		ID: "http.handlers.varc",
 		New: func() caddy.Module {
 			return &Handler{
-				Options: proxy.DefaultOptions(),
+				Options: httpcache.DefaultOptions(),
 			}
 		},
 	}
@@ -70,7 +70,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.upstreamURL = parsedURL
 	}
 
-	handler, err := proxy.NewHandler(h.Options)
+	handler, err := httpcache.NewHandler(h.Options)
 	if err != nil {
 		return fmt.Errorf("failed to create cache handler: %w", err)
 	}
@@ -195,7 +195,7 @@ func (h *Handler) resolveTargetURL(r *http.Request) string {
 // parseCaddyfile parses the Caddyfile configuration.
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	v := &Handler{
-		Options: proxy.DefaultOptions(),
+		Options: httpcache.DefaultOptions(),
 	}
 	err := v.UnmarshalCaddyfile(h.Dispenser)
 	return v, err

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/tgdrive/varc/pkg/proxy"
+	"github.com/tgdrive/varc/httpcache"
 )
 
 func TestUnmarshalCaddyfile(t *testing.T) {
@@ -22,7 +22,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		`)
 
 		v := &Handler{
-			Options: proxy.DefaultOptions(),
+			Options: httpcache.DefaultOptions(),
 		}
 
 		err := v.UnmarshalCaddyfile(d)
@@ -73,7 +73,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		`)
 
 		v := &Handler{
-			Options: proxy.DefaultOptions(),
+			Options: httpcache.DefaultOptions(),
 		}
 
 		err := v.UnmarshalCaddyfile(d)
@@ -97,7 +97,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		`)
 
 		v := &Handler{
-			Options: proxy.DefaultOptions(),
+			Options: httpcache.DefaultOptions(),
 		}
 
 		err := v.UnmarshalCaddyfile(d)
@@ -121,7 +121,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		`)
 
 		v := &Handler{
-			Options: proxy.DefaultOptions(),
+			Options: httpcache.DefaultOptions(),
 		}
 
 		err := v.UnmarshalCaddyfile(d)
@@ -142,7 +142,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		`)
 
 		v := &Handler{
-			Options: proxy.DefaultOptions(),
+			Options: httpcache.DefaultOptions(),
 		}
 
 		err := v.UnmarshalCaddyfile(d)

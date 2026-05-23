@@ -12,20 +12,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tgdrive/varc/pkg/proxy"
+	"github.com/tgdrive/varc/httpcache"
 
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
 )
 
 var (
-	port = pflag.String("port", "8080", "Port to listen on")
-	cacheDir = pflag.String("cache-dir", filepath.Join(os.TempDir(), "varc_cache"), "Cache directory")
-	chunkSize = pflag.String("chunk-size", "", "Chunk size for reading (e.g., 4M)")
+	port         = pflag.String("port", "8080", "Port to listen on")
+	cacheDir     = pflag.String("cache-dir", filepath.Join(os.TempDir(), "varc_cache"), "Cache directory")
+	chunkSize    = pflag.String("chunk-size", "", "Chunk size for reading (e.g., 4M)")
 	chunkStreams = pflag.Int("chunk-streams", 2, "Number of parallel chunk streams")
-	stripQuery = pflag.Bool("strip-query", false, "Strip query parameters from URL for caching")
-	stripDomain = pflag.Bool("strip-domain", false, "Strip domain from URL for caching")
-	shardLevel = pflag.Int("shard-level", 1, "Number of shard levels for cache paths")
+	stripQuery   = pflag.Bool("strip-query", false, "Strip query parameters from URL for caching")
+	stripDomain  = pflag.Bool("strip-domain", false, "Strip domain from URL for caching")
+	shardLevel   = pflag.Int("shard-level", 1, "Number of shard levels for cache paths")
 )
 
 func main() {
@@ -37,7 +37,7 @@ func main() {
 	}
 	defer zapLogger.Sync()
 
-	opt := proxy.Options{
+	opt := httpcache.Options{
 		CacheDir:          *cacheDir,
 		CacheChunkSize:    *chunkSize,
 		CacheChunkStreams: *chunkStreams,
@@ -47,7 +47,7 @@ func main() {
 		Logger:            zapLogger.Sugar(),
 	}
 
-	handler, err := proxy.NewHandler(opt)
+	handler, err := httpcache.NewHandler(opt)
 	if err != nil {
 		zapLogger.Fatal("Failed to create handler", zap.Error(err))
 	}

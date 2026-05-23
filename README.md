@@ -118,6 +118,89 @@ When no upstream is configured, varc resolves the target URL from the request:
 
 This is useful for caching arbitrary URLs at a single entry point.
 
+## Go Package
+
+Use `github.com/tgdrive/varc` directly when another Go application should own routing, auth, telemetry, or reader wrapping.
+
+```go
+package main
+
+import (
+    "context"
+    "io"
+    "os"
+
+    "github.com/tgdrive/varc"
+)
+
+func main() {
+    cache, err := varc.New(context.Background(), varc.Options{
+        CacheDir: "/tmp/varc-cache",
+    })
+    if err != nil {
+        panic(err)
+    }
+    defer cache.Close()
+
+    f, err := os.Open("video.mp4")
+    if err != nil {
+        panic(err)
+    }
+    defer f.Close()
+
+    info, err := f.Stat()
+    if err != nil {
+        panic(err)
+    }
+
+    reader, err := cache.OpenReadSeeker(
+        context.Background(),
+        f,
+        varc.WithKey("videos/video.mp4"),
+        varc.WithSize(info.Size()),
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer reader.Close()
+
+    // reader implements io.Reader, io.ReaderAt, io.Seeker, io.Closer, and Size().
+    wrapped := io.LimitReader(reader, 1024)
+    _, _ = io.Copy(io.Discard, wrapped)
+}
+```
+
+You can also use `io.ReaderAt` sources:
+
+```go
+reader, err := cache.OpenReaderAt(
+    ctx,
+    readerAt,
+    varc.WithKey("my-cache-key"),
+    varc.WithSize(size),
+    varc.WithFingerprint(etag),
+)
+```
+
+For advanced sources, implement `varc.RemoteObject` directly. Optional interfaces improve cache validation and metadata preservation:
+
+```go
+type FingerprintedRemote struct{}
+
+func (FingerprintedRemote) Fingerprint() string { return "etag-or-content-hash" }
+func (FingerprintedRemote) ModTime(ctx context.Context) time.Time { return modTime }
+```
+
+The package API is intentionally read-through only. Varc writes downloaded ranges to disk cache, but it does not expose rclone-style writeback/upload semantics.
+
+For an HTTP handler adapter, import `github.com/tgdrive/varc/httpcache`:
+
+```go
+handler, err := httpcache.NewHandler(httpcache.Options{
+    CacheDir: "/tmp/varc-cache",
+})
+```
+
 ### Building with xcaddy
 
 Build a custom Caddy binary with the varc module baked in using [xcaddy](https://github.com/caddyserver/xcaddy):
@@ -228,7 +311,7 @@ stats := handler.Metrics().Snapshot()
 // }
 ```
 
-Cache engine stats (items count, bytes used, upload queue depth) are merged into the same snapshot.
+Cache engine stats (items count, bytes used, cache root, metadata root) are merged into the same snapshot.
 
 In the Caddy module, configure a metrics endpoint with the `metrics` subdirective:
 
@@ -246,7 +329,7 @@ When the upstream server is unreachable or returns an error, varc automatically 
 
 ### Access Logging
 
-If a `Logger` is configured (via `types.Logger`), each request is logged with:
+If a `Logger` is configured, each request is logged with:
 
 ```
 [proxy] GET /stream?url=https://example.com/video.mp4 200 1048576 1.234s
@@ -267,10 +350,10 @@ In standalone mode, this uses `zap` structured logging (production quality).
 
 ```bash
 # Build
-go build -o varc .
+go build -o varc ./cmd/varc
 
 # Run tests
 go test ./...
 
 # Cross-compile
-GOOS=linux GOARCH=amd64 go build -o varc-linux-amd64 .
+GOOS=linux GOARCH=amd64 go build -o varc-linux-amd64 ./cmd/varc

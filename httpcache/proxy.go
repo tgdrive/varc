@@ -1,4 +1,4 @@
-package proxy
+package httpcache
 
 import (
 	"context"
@@ -22,13 +22,13 @@ import (
 
 // Metrics tracks cache proxy performance counters.
 type Metrics struct {
-	mu   sync.Mutex
-	Requests        int64 `json:"requests"`
-	Hits            int64 `json:"hits"`
-	Misses          int64 `json:"misses"`
-	BytesServed     int64 `json:"bytes_served"`
+	mu                sync.Mutex
+	Requests          int64 `json:"requests"`
+	Hits              int64 `json:"hits"`
+	Misses            int64 `json:"misses"`
+	BytesServed       int64 `json:"bytes_served"`
 	BytesFromUpstream int64 `json:"bytes_from_upstream"`
-	Purges          int64 `json:"purges"`
+	Purges            int64 `json:"purges"`
 }
 
 // Snapshot returns a copy of the current metrics as a map.
@@ -58,8 +58,6 @@ func (m *Metrics) add(field *int64, n int64) {
 	*field += n
 	m.mu.Unlock()
 }
-
-
 
 // Options holds configuration for the cache proxy handler
 type Options struct {
@@ -114,10 +112,10 @@ func (m *mapping) get(cachePath string) (cacheEntry, bool) {
 
 // Handler is the cache proxy HTTP handler
 type Handler struct {
-	Engine      *internal.Engine
-	mapping     *mapping
-	client      *http.Client
-	metrics     *Metrics
+	Engine  *internal.Engine
+	mapping *mapping
+	client  *http.Client
+	metrics *Metrics
 
 	stripQuery  bool
 	stripDomain bool
@@ -491,6 +489,7 @@ func (h *Handler) newHTTPFile(cachePath string) *remoteFile {
 	// First do a HEAD request to get metadata
 	size := int64(-1)
 	modTime := time.Time{}
+	etag := ""
 
 	req, err := http.NewRequest("HEAD", entry.url, nil)
 	if err == nil {
@@ -502,6 +501,7 @@ func (h *Handler) newHTTPFile(cachePath string) *remoteFile {
 		resp, err := h.client.Do(req)
 		if err == nil {
 			if resp.StatusCode == http.StatusOK {
+				etag = resp.Header.Get("ETag")
 				if cl := resp.Header.Get("Content-Length"); cl != "" {
 					if parsed, err := strconv.ParseInt(cl, 10, 64); err == nil {
 						size = parsed
@@ -517,7 +517,7 @@ func (h *Handler) newHTTPFile(cachePath string) *remoteFile {
 		}
 	}
 
-	return newHTTPFile(entry.url, entry.headers, size, modTime, h.client)
+	return newHTTPFile(entry.url, entry.headers, size, modTime, etag, h.client)
 }
 
 // parseSize parses a size string like "100M", "1G", etc.
