@@ -2,7 +2,6 @@ package httpcache
 
 import (
 	"context"
-	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,8 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tgdrive/varc/internal"
-	"github.com/tgdrive/varc/internal/types"
+	"github.com/tgdrive/varc"
 )
 
 // Metrics tracks cache proxy performance counters.
@@ -70,7 +68,7 @@ type Options struct {
 	StripDomain       bool         `caddy:"strip_domain"`
 	ShardLevel        int          `caddy:"shard_level"`
 	Passthrough       bool         `caddy:"passthrough"`
-	Logger            types.Logger `caddy:"-"`
+	Logger            varc.Logger  `caddy:"-"`
 }
 
 // DefaultOptions returns Options with sensible defaults
@@ -81,41 +79,12 @@ func DefaultOptions() Options {
 	}
 }
 
-// mapping tracks URL-to-cache-path mappings so the cache engine knows
-// which upstream URL and headers to use for each cache path
-type mapping struct {
-	mu      sync.RWMutex
-	entries map[string]cacheEntry
-}
-
-type cacheEntry struct {
-	url     string
-	headers http.Header
-}
-
-func newMapping() *mapping {
-	return &mapping{entries: make(map[string]cacheEntry)}
-}
-
-func (m *mapping) put(url, cachePath string, headers http.Header) {
-	m.mu.Lock()
-	m.entries[cachePath] = cacheEntry{url: url, headers: headers.Clone()}
-	m.mu.Unlock()
-}
-
-func (m *mapping) get(cachePath string) (cacheEntry, bool) {
-	m.mu.RLock()
-	e, ok := m.entries[cachePath]
-	m.mu.RUnlock()
-	return e, ok
-}
-
 // Handler is the cache proxy HTTP handler
 type Handler struct {
-	Engine  *internal.Engine
-	mapping *mapping
-	client  *http.Client
-	metrics *Metrics
+	cache       *varc.Cache
+	client      *http.Client
+	metrics     *Metrics
+	logger      varc.Logger
 
 	stripQuery  bool
 	stripDomain bool
@@ -132,19 +101,17 @@ func NewHandler(opt Options) (*Handler, error) {
 		cacheDir = filepath.Join(os.TempDir(), "varc_cache")
 	}
 
-	// Build engine options
-	engOpt := &types.Options{
-		CacheDir: cacheDir,
-	}
-
-	if opt.Logger != nil {
-		engOpt.Logger = opt.Logger
+	varcOpt := varc.Options{
+		CacheDir:          cacheDir,
+		ChunkStreams:      opt.CacheChunkStreams,
+		ShardLevel:        opt.ShardLevel,
+		Logger:            opt.Logger,
 	}
 
 	if opt.CacheMaxAge != "" {
 		d, err := time.ParseDuration(opt.CacheMaxAge)
 		if err == nil {
-			engOpt.CacheMaxAge = d
+			varcOpt.CacheMaxAge = d
 		} else {
 			return nil, fmt.Errorf("invalid cache-max-age: %w", err)
 		}
@@ -152,29 +119,26 @@ func NewHandler(opt Options) (*Handler, error) {
 	if opt.CacheMaxSize != "" {
 		s, err := parseSize(opt.CacheMaxSize)
 		if err == nil {
-			engOpt.CacheMaxSize = s
+			varcOpt.CacheMaxSize = s
 		}
 	}
 	if opt.CacheChunkSize != "" {
 		s, err := parseSize(opt.CacheChunkSize)
 		if err == nil {
-			engOpt.ChunkSize = s
+			varcOpt.ChunkSize = s
 		}
 	}
-	engOpt.ChunkStreams = opt.CacheChunkStreams
 
-	engOpt.Init()
-
-	engInstance, err := internal.New(ctx, engOpt)
+	cache, err := varc.New(ctx, varcOpt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create engine: %w", err)
+		return nil, fmt.Errorf("failed to create cache: %w", err)
 	}
 
 	return &Handler{
-		Engine:      engInstance,
-		mapping:     newMapping(),
+		cache:       cache,
 		client:      &http.Client{Timeout: 30 * time.Second},
 		metrics:     &Metrics{},
+		logger:      opt.Logger,
 		stripQuery:  opt.StripQuery,
 		stripDomain: opt.StripDomain,
 		shardLevel:  opt.ShardLevel,
@@ -182,9 +146,9 @@ func NewHandler(opt Options) (*Handler, error) {
 	}, nil
 }
 
-// Shutdown shuts down the handler
+// Shutdown shuts down the cache
 func (h *Handler) Shutdown() {
-	h.Engine.Close()
+	h.cache.Close()
 }
 
 // Metrics returns a reference to the handler's metrics collector
@@ -195,8 +159,8 @@ func (h *Handler) Metrics() *Metrics {
 // ServeMetrics writes a JSON snapshot of the current metrics to w
 func (h *Handler) ServeMetrics(w http.ResponseWriter) {
 	stats := h.metrics.Snapshot()
-	engineStats := h.Engine.Stats()
-	for k, v := range engineStats {
+	cacheStats := h.cache.Stats()
+	for k, v := range cacheStats {
 		if vi, ok := v.(int64); ok {
 			stats[k] = vi
 		}
@@ -205,8 +169,8 @@ func (h *Handler) ServeMetrics(w http.ResponseWriter) {
 	json.NewEncoder(w).Encode(stats)
 }
 
-// hashCachePath computes a cache path from a URL
-func (h *Handler) hashCachePath(targetURL string) string {
+// cacheKeyURL strips query and/or domain from a URL to produce a logical cache key.
+func (h *Handler) cacheKeyURL(targetURL string) string {
 	keyURL := targetURL
 	if h.stripQuery {
 		if idx := strings.Index(keyURL, "?"); idx >= 0 {
@@ -224,17 +188,7 @@ func (h *Handler) hashCachePath(targetURL string) string {
 			keyURL = rest
 		}
 	}
-
-	hash := fmt.Sprintf("%x", md5.Sum([]byte(keyURL)))
-
-	if h.shardLevel > 0 {
-		sharded := ""
-		for i := 0; i < h.shardLevel && i*2 < len(hash); i++ {
-			sharded += string(hash[i*2]) + string(hash[i*2+1]) + "/"
-		}
-		return sharded + hash
-	}
-	return hash
+	return keyURL
 }
 
 // shouldPassthrough returns true if the request should bypass the cache
@@ -259,7 +213,6 @@ func (h *Handler) proxyDirect(w http.ResponseWriter, r *http.Request, targetURL 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Copy original headers
 	for k, vv := range r.Header {
 		for _, v := range vv {
 			req.Header.Add(k, v)
@@ -271,7 +224,6 @@ func (h *Handler) proxyDirect(w http.ResponseWriter, r *http.Request, targetURL 
 		return
 	}
 	defer resp.Body.Close()
-	// Copy response headers
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -283,15 +235,9 @@ func (h *Handler) proxyDirect(w http.ResponseWriter, r *http.Request, targetURL 
 
 // handlePurge handles PURGE requests to remove items from cache
 func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request, targetURL string) {
-	cachePath := h.hashCachePath(targetURL)
+	keyURL := h.cacheKeyURL(targetURL)
 
-	// Remove from mapping
-	h.mapping.mu.Lock()
-	delete(h.mapping.entries, cachePath)
-	h.mapping.mu.Unlock()
-
-	// Remove from cache
-	err := h.Engine.Remove(cachePath)
+	err := h.cache.Remove(keyURL)
 	if err != nil {
 		http.Error(w, "Purge failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -305,59 +251,28 @@ func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request, targetURL 
 	w.Write([]byte("Purged"))
 }
 
-// tryStaleServe attempts to serve stale data from cache when upstream is unavailable.
-// Returns true if stale data was served.
-func (h *Handler) tryStaleServe(w http.ResponseWriter, r *http.Request, cachePath string) bool {
-	item := h.Engine.CacheItem(cachePath)
-	if item == nil || !item.Exists() {
-		return false
-	}
-
-	// Open cached file handle (no upstream fetch)
-	fh, err := h.Engine.OpenCached(cachePath, nil)
-	if err != nil {
-		return false
-	}
-	defer fh.Close()
-
-	info, _ := fh.Stat()
-	size := info.Size()
-	modTime := info.ModTime()
-
-	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	w.Header().Set("X-Cache", "STALE")
-	if !modTime.IsZero() {
-		w.Header().Set("Last-Modified", modTime.UTC().Format(http.TimeFormat))
-	}
-
-	if size >= 0 {
-		http.ServeContent(w, r, cachePath, modTime, fh)
-	} else {
-		io.Copy(w, fh)
-	}
-	return true
-}
-
-// accessLog logs an HTTP request to the engine's logger if available
+// accessLog logs an HTTP request to the configured logger
 func (h *Handler) accessLog(r *http.Request, status int, size int64, duration time.Duration) {
-	if h.Engine != nil && h.Engine.Opt.Logger != nil {
-		h.Engine.Opt.Logger.Infof("[proxy] %s %s %d %d %v", r.Method, r.URL.String(), status, size, duration)
+	if h.logger != nil {
+		h.logger.Infof("[proxy] %s %s %d %d %v", r.Method, r.URL.String(), status, size, duration)
 	}
 }
 
 // Serve handles an HTTP request for the given targetURL.
 //
-// It opens the file through the disk cache, associating it with the
-// upstream URL so that the cache engine can fetch the file on cache misses.
-// Supports PURGE, conditional requests (If-Modified-Since, If-None-Match),
-// passthrough for non-GET methods, and stale-serve on upstream errors.
+// It opens the file through the disk cache. Supports PURGE, conditional
+// requests (If-Modified-Since, If-None-Match), and passthrough for
+// non-GET methods or requests with Authorization/Cookie headers.
 func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string) {
 	if targetURL == "" {
 		http.Error(w, "Target URL is required", http.StatusBadRequest)
 		return
 	}
 
-	cachePath := h.hashCachePath(targetURL)
+	keyURL := h.cacheKeyURL(targetURL)
+	// Compute the cache path for ETag/Content-Type (varc.Cache.Open()
+	// applies the same ShardKey internally, so the result matches).
+	cachePath := varc.ShardKey(keyURL, h.shardLevel)
 	start := time.Now()
 
 	// Handle PURGE requests
@@ -386,49 +301,36 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 		}
 	}
 
-	h.mapping.put(targetURL, cachePath, upstreamHeaders)
+	h.metrics.inc(&h.metrics.Requests)
 
-	// Create an httpFile to associate with this cache path
-	httpFile := h.newHTTPFile(cachePath)
+	var reader varc.Reader
+	var openErr error
 
-	// Track cache hit/miss
-	cachedItem := h.Engine.CacheItem(cachePath)
-	isCached := cachedItem.Exists()
-
-	h.metrics.mu.Lock()
-	h.metrics.Requests++
-	if isCached {
-		h.metrics.Hits++
+	// Check if the file is already cached. If so, we can serve it without
+	// any upstream HEAD request — the cache engine reads the size from the
+	// file stat on disk.
+	if h.cache.Exists(keyURL) {
+		h.metrics.inc(&h.metrics.Hits)
+		reader, openErr = h.cache.Open(context.Background(), keyURL, nil)
 	} else {
-		h.metrics.Misses++
-	}
-	h.metrics.mu.Unlock()
-
-	// Open through disk cache with the httpFile
-	fh, err := h.Engine.OpenCached(cachePath, httpFile)
-	if err != nil {
-		// Try stale-serve if upstream is unavailable
-		if h.tryStaleServe(w, r, cachePath) {
-			h.metrics.mu.Lock()
-			h.metrics.Hits++
-			h.metrics.mu.Unlock()
-			h.accessLog(r, http.StatusOK, 0, time.Since(start))
+		h.metrics.inc(&h.metrics.Misses)
+		// Discover file metadata via HEAD (the cache engine requires known sizes).
+		httpFile := newHTTPFile(targetURL, upstreamHeaders, h.client)
+		if err := httpFile.Discover(); err != nil {
+			h.accessLog(r, http.StatusBadGateway, 0, time.Since(start))
+			http.Error(w, "Failed to discover file: "+err.Error(), http.StatusBadGateway)
 			return
 		}
-		http.Error(w, "Failed to open file: "+err.Error(), http.StatusInternalServerError)
+		reader, openErr = h.cache.Open(context.Background(), keyURL, httpFile)
+	}
+	if openErr != nil {
+		http.Error(w, "Failed to open file: "+openErr.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer fh.Close()
+	defer reader.Close()
 
-	// Get file info
-	info, err := fh.Stat()
-	if err != nil {
-		http.Error(w, "Failed to stat file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	size := info.Size()
-	modTime := info.ModTime()
+	size := reader.Size()
+	modTime := reader.ModTime()
 
 	// Handle conditional requests
 	if !modTime.IsZero() {
@@ -462,13 +364,13 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 
 	// Serve content (handles Range requests via http.ServeContent)
 	if size >= 0 {
-		http.ServeContent(w, r, cachePath, modTime, fh)
+		http.ServeContent(w, r, cachePath, modTime, reader)
 	} else {
 		if r.Header.Get("Range") != "" {
 			http.Error(w, "Cannot use Range on files of unknown length", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
-		io.Copy(w, fh)
+		io.Copy(w, reader)
 	}
 
 	// Access log and metrics
@@ -476,48 +378,6 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 	h.metrics.BytesServed += size
 	h.metrics.mu.Unlock()
 	h.accessLog(r, http.StatusOK, size, time.Since(start))
-}
-
-// newHTTPFile creates an httpFile for the given cache path, looking up
-// the upstream URL and headers from the mapping.
-func (h *Handler) newHTTPFile(cachePath string) *remoteFile {
-	entry, ok := h.mapping.get(cachePath)
-	if !ok {
-		return &remoteFile{size: -1}
-	}
-
-	// First do a HEAD request to get metadata
-	size := int64(-1)
-	modTime := time.Time{}
-	etag := ""
-
-	req, err := http.NewRequest("HEAD", entry.url, nil)
-	if err == nil {
-		for k, vv := range entry.headers {
-			for _, v := range vv {
-				req.Header.Add(k, v)
-			}
-		}
-		resp, err := h.client.Do(req)
-		if err == nil {
-			if resp.StatusCode == http.StatusOK {
-				etag = resp.Header.Get("ETag")
-				if cl := resp.Header.Get("Content-Length"); cl != "" {
-					if parsed, err := strconv.ParseInt(cl, 10, 64); err == nil {
-						size = parsed
-					}
-				}
-				if lm := resp.Header.Get("Last-Modified"); lm != "" {
-					if parsed, err := http.ParseTime(lm); err == nil {
-						modTime = parsed
-					}
-				}
-			}
-			resp.Body.Close()
-		}
-	}
-
-	return newHTTPFile(entry.url, entry.headers, size, modTime, etag, h.client)
 }
 
 // parseSize parses a size string like "100M", "1G", etc.

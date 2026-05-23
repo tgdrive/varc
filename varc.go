@@ -8,6 +8,7 @@ package varc
 
 import (
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -109,6 +110,29 @@ type Reader interface {
 	io.Seeker
 	io.Closer
 	Size() int64
+	ModTime() time.Time
+}
+
+// ShardKey hashes key with MD5 and optionally applies directory sharding.
+//
+// If level <= 0, the hex MD5 hash is returned as-is.
+// If level > 0, the hash is split into level subdirectory pairs.
+// For example, ShardKey("https://example.com/file", 2) might return "ab/cd/abcdef...".
+//
+// The core cache transparently creates the subdirectories on disk via
+// createItemDir, so sharded keys work with any Cache operation.
+func ShardKey(key string, level int) string {
+	hash := fmt.Sprintf("%x", md5.Sum([]byte(key)))
+	if level <= 0 {
+		return hash
+	}
+	var b strings.Builder
+	for i := 0; i < level && i*2 < len(hash); i++ {
+		b.WriteString(hash[i*2 : i*2+2])
+		b.WriteByte('/')
+	}
+	b.WriteString(hash)
+	return b.String()
 }
 
 // Options configures Cache.
@@ -124,6 +148,7 @@ type Options struct {
 	ReadAhead         int64
 	FastFingerprint   bool
 	HandleCaching     time.Duration
+	ShardLevel        int
 	Logger            Logger
 }
 
@@ -144,7 +169,8 @@ func DefaultOptions() Options {
 
 // Cache is an importable read-through range cache.
 type Cache struct {
-	engine *internal.Engine
+	engine     *internal.Engine
+	shardLevel int
 }
 
 // New creates a Cache. Zero-valued options are filled from DefaultOptions.
@@ -173,16 +199,18 @@ func New(ctx context.Context, opt Options) (*Cache, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Cache{engine: engine}, nil
+	return &Cache{engine: engine, shardLevel: merged.ShardLevel}, nil
 }
 
 // Open opens key from the local cache, filling cache misses from obj.
 // Pass obj=nil for cache-only reads.
+// If Options.ShardLevel > 0, the key is automatically sharded via ShardKey.
 func (c *Cache) Open(ctx context.Context, key string, obj RemoteObject) (Reader, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	h, err := c.engine.OpenCached(key, adaptRemote(obj))
+	cacheKey := ShardKey(key, c.shardLevel)
+	h, err := c.engine.OpenCached(cacheKey, adaptRemote(obj))
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +219,7 @@ func (c *Cache) Open(ctx context.Context, key string, obj RemoteObject) (Reader,
 }
 
 // OpenObject opens obj using obj.Key as the cache key.
+// If Options.ShardLevel > 0, the key is automatically sharded via ShardKey.
 func (c *Cache) OpenObject(ctx context.Context, obj Object) (Reader, error) {
 	if obj.Key == "" {
 		return nil, errors.New("varc: object key is required")
@@ -238,9 +267,16 @@ func (c *Cache) OpenReaderAt(ctx context.Context, src io.ReaderAt, opts ...Objec
 	return c.OpenObject(ctx, obj)
 }
 
+// Exists checks whether key has an existing cache file on disk.
+func (c *Cache) Exists(key string) bool {
+	cacheKey := ShardKey(key, c.shardLevel)
+	return c.engine.Exists(cacheKey)
+}
+
 // Remove evicts key from the cache.
 func (c *Cache) Remove(key string) error {
-	return c.engine.Remove(key)
+	cacheKey := ShardKey(key, c.shardLevel)
+	return c.engine.Remove(cacheKey)
 }
 
 // Stats returns cache statistics.
@@ -419,6 +455,14 @@ func (r *cacheReader) Size() int64 {
 	return r.sizer.Size()
 }
 
+func (r *cacheReader) ModTime() time.Time {
+	info, err := r.handle.Stat()
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
 type remoteAdapter struct {
 	remote RemoteObject
 }
@@ -513,6 +557,9 @@ func mergeOptions(defaults, override Options) Options {
 	}
 	if override.FastFingerprint {
 		defaults.FastFingerprint = true
+	}
+	if override.ShardLevel > 0 {
+		defaults.ShardLevel = override.ShardLevel
 	}
 	if override.HandleCaching != 0 {
 		defaults.HandleCaching = override.HandleCaching

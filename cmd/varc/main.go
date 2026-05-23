@@ -82,7 +82,7 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"ok","cache_dir":"%s"}`, handler.Engine.Opt.CacheDir)
+		fmt.Fprintf(w, `{"status":"ok"}`)
 	})
 
 	srv := &http.Server{
@@ -95,10 +95,9 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		zapLogger.Info("Engine listening",
+		zapLogger.Info("Proxy listening",
 			zap.String("addr", ":"+*port),
-
-			zap.String("cache_dir", handler.Engine.Opt.CacheDir),
+			zap.String("cache_dir", *cacheDir),
 		)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			zapLogger.Fatal("Listen error", zap.Error(err))

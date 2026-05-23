@@ -252,28 +252,29 @@ func (e *Engine) OpenCached(filePath string, obj types.RemoteObject) (Handle, er
 		return nil, os.ErrInvalid
 	}
 
-	// Get or create the cache item
+	// Pre-create the cache item so it's available for GetSize/Stat below.
+	// The actual item.Open call happens later in newReadFileHandle.
 	item := e.cache.Item(filePath)
 	if item == nil {
 		return nil, fmt.Errorf("failed to create cache item for %s", filePath)
 	}
 
-	// Open the cache item with the remote object if provided
-	if obj != nil {
-		if err := item.Open(obj); err != nil {
-			return nil, fmt.Errorf("failed to open cache item: %w", err)
-		}
-	}
-
-	// Ensure the file node exists in the engine tree
-	_, err := e.root.Stat(filePath)
+	// Ensure the file node exists in the engine tree and has the
+	// current remote object (which may be nil for cache-only opens).
+	node, err := e.root.Stat(filePath)
 	if err != nil {
 		d := e.root
 		f := newFile(e.ctx, d, filePath)
-		if size, err := item.GetSize(); err == nil {
-			f.size.Store(size)
+		if sz, err := item.GetSize(); err == nil {
+			f.size.Store(sz)
 		}
+		f.remote = obj
 		d.AddChild(filePath, f)
+	} else if f, ok := node.(*File); ok {
+		// Update the remote on the existing file node so that
+		// newReadFileHandle sees the current remote rather than a
+		// stale value from a previous OpenCached call.
+		f.remote = obj
 	}
 
 	return e.root.OpenFile(filePath, os.O_RDONLY, 0)
@@ -282,6 +283,11 @@ func (e *Engine) OpenCached(filePath string, obj types.RemoteObject) (Handle, er
 // CacheItem returns the cache item for a path, creating it if needed
 func (e *Engine) CacheItem(path string) *cache.Item {
 	return e.cache.Item(path)
+}
+
+// Exists checks whether the given path has an existing cache file on disk.
+func (e *Engine) Exists(path string) bool {
+	return e.cache.Exists(path)
 }
 
 // Remove removes an item from the cache by name.

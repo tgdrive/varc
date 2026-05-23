@@ -427,7 +427,7 @@ func (item *Item) _createFile(osPath string) (err error) {
 		return errors.New("cache item: internal error: didn't Close file")
 	}
 	// t0 := time.Now()
-	fd, err := file.OpenFile(osPath, os.O_RDWR, 0600)
+	fd, err := file.OpenFile(osPath, os.O_RDWR|os.O_CREATE, 0600)
 	// item.c.opt.Logger.Debugf("%s: OpenFile took %v", item.name, time.Since(t0))
 	if err != nil {
 		return fmt.Errorf("cache item: open failed: %w", err)
@@ -530,6 +530,19 @@ func (item *Item) open(o types.RemoteObject) (err error) {
 		item.opens--
 		return fmt.Errorf("cache item: create cache file failed: %w", err)
 	}
+
+	// Apply modtime from the remote object so GetModTime() returns
+	// the correct value immediately, not only after _actualClose().
+	if item.o != nil {
+		if mt, ok := item.o.(modTimer); ok {
+			if modTime := mt.ModTime(item.c.ctx); !modTime.IsZero() {
+				item._setModTime(modTime)
+				item.info.ModTime = modTime
+				_ = item._save()
+			}
+		}
+	}
+
 	// Unlock the Item.mu so we can call some methods which take Cache.mu
 	item.mu.Unlock()
 
@@ -697,8 +710,10 @@ func (item *Item) reload(ctx context.Context) error {
 // call with lock held
 func (item *Item) _checkObject(o types.RemoteObject) error {
 	if o == nil {
-		// Varc uses nil remote objects for cache-only/stale reads. Unlike rclone VFS,
+		// Varc uses nil remote objects for cache-only reads. Unlike rclone VFS,
 		// nil does not mean the remote object was deleted, so keep existing cache data.
+		// The caller (newReadFileHandle) should not end up here with a nil o and no
+		// cached data — the existence check happens at a higher level.
 	} else {
 		remoteFingerprint := _fingerprint(o, item.c.opt.FastFingerprint)
 		item.c.opt.Logger.Debugf("%s: cache: checking remote fingerprint %q against cached fingerprint %q", item.name, remoteFingerprint, item.info.Fingerprint)
@@ -711,13 +726,15 @@ func (item *Item) _checkObject(o types.RemoteObject) error {
 				item.c.opt.Logger.Debugf("%s: cache: removing cached entry as stale (remote fingerprint %q != cached fingerprint %q)", item.name, remoteFingerprint, item.info.Fingerprint)
 				item._remove("stale (remote is different)")
 				item.info.Fingerprint = remoteFingerprint
+				item.info.Size = o.Size()
 			}
+			// Fingerprints match — keep existing cached data and size.
 		} else {
 			// remote object && no local object
-			// Set fingerprint
+			// Set fingerprint and size from the remote
 			item.info.Fingerprint = remoteFingerprint
+			item.info.Size = o.Size()
 		}
-		item.info.Size = o.Size()
 	}
 	item.o = o
 
@@ -1167,14 +1184,16 @@ func (item *Item) readAt(b []byte, off int64) (n int, err error) {
 		return 0, err
 	}
 
-	// Check to see if object has shrunk - if so don't read too much.
-	if item.o != nil && item.o.Size() != item.info.Size {
-		item.c.opt.Logger.Debugf("%s: Size has changed from %d to %d", item.o, item.info.Size, item.o.Size())
-		err = item._truncate(item.o.Size())
-		if err != nil {
-			return 0, err
-		}
-	}
+	// In rclone VFS this block detects when the remote object's size has
+	// changed and truncates the cache file to match. In varc the remote
+	// object is replaced on each Open call (e.g. with a different
+	// fingerprint), so a size difference does not mean the underlying
+	// content changed — fingerprint invalidation in _checkObject handles
+	// that. Unconditionally truncating would corrupt a cache-hit open
+	// where a new remote happens to have a different size.
+	// if item.o != nil && item.o.Size() != item.info.Size {
+	// 	...
+	// }
 
 	item.info.ATime = time.Now()
 	// Do the reading with Item.mu unlocked and cache protected by preAccess

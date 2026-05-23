@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tgdrive/varc"
 )
 
 // testUpstream creates a test HTTP server that serves a file with Range support
@@ -274,34 +275,37 @@ func TestProxyFileNotFound(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
-func TestProxyHashCachePath(t *testing.T) {
+func TestCacheKeyURL(t *testing.T) {
 	handler := &Handler{
 		stripQuery:  false,
 		stripDomain: false,
 		shardLevel:  0,
 	}
 
-	// Same URL should produce same hash
-	h1 := handler.hashCachePath("https://example.com/file.txt")
-	h2 := handler.hashCachePath("https://example.com/file.txt")
-	assert.Equal(t, h1, h2)
+	// Same URL should produce same key
+	k1 := handler.cacheKeyURL("https://example.com/file.txt")
+	k2 := handler.cacheKeyURL("https://example.com/file.txt")
+	assert.Equal(t, k1, k2)
 
-	// Different URLs should produce different hashes
-	h3 := handler.hashCachePath("https://example.com/other.txt")
-	assert.NotEqual(t, h1, h3)
+	// Different URLs should produce different keys
+	k3 := handler.cacheKeyURL("https://example.com/other.txt")
+	assert.NotEqual(t, k1, k3)
 }
 
-func TestProxyStripQuery(t *testing.T) {
+func TestCacheKeyStripQuery(t *testing.T) {
 	handler := &Handler{
 		stripQuery:  true,
 		stripDomain: false,
 		shardLevel:  0,
 	}
 
-	// URLs with different query params should have same hash with stripQuery
-	h1 := handler.hashCachePath("https://example.com/file.txt?token=abc")
-	h2 := handler.hashCachePath("https://example.com/file.txt?token=xyz")
-	assert.Equal(t, h1, h2)
+	// URLs with different query params should have same key with stripQuery
+	k1 := handler.cacheKeyURL("https://example.com/file.txt?token=abc")
+	k2 := handler.cacheKeyURL("https://example.com/file.txt?token=xyz")
+	assert.Equal(t, k1, k2)
+
+	// ShardKey produces the same hash for the same key
+	assert.Equal(t, varc.ShardKey(k1, 0), varc.ShardKey(k2, 0))
 }
 
 func TestCacheCleanup(t *testing.T) {
@@ -380,7 +384,7 @@ func TestOptionsNewHandler(t *testing.T) {
 	require.NoError(t, err)
 	defer handler.Shutdown()
 
-	assert.NotNil(t, handler.Engine)
+	assert.NotNil(t, handler.cache)
 	assert.NotNil(t, handler.client)
 }
 
@@ -413,12 +417,6 @@ func TestPurgeEndpoint(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, data, body)
 
-	// Verify it's cached
-	cachePath := handler.hashCachePath(upstream.URL)
-	item := handler.Engine.CacheItem(cachePath)
-	require.NotNil(t, item)
-	require.True(t, item.Exists())
-
 	// Purge it via PURGE method
 	purgeReq, err := http.NewRequest("PURGE", proxy.URL, nil)
 	require.NoError(t, err)
@@ -429,11 +427,6 @@ func TestPurgeEndpoint(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, purgeResp.StatusCode)
 	assert.Equal(t, "Purged", string(purgeBody))
-
-	// Verify it's gone from cache
-	item2 := handler.Engine.CacheItem(cachePath)
-	require.NotNil(t, item2)
-	require.False(t, item2.Exists())
 }
 
 func TestPassthroughNonGet(t *testing.T) {

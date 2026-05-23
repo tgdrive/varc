@@ -118,88 +118,286 @@ When no upstream is configured, varc resolves the target URL from the request:
 
 This is useful for caching arbitrary URLs at a single entry point.
 
-## Go Package
+## Go Library
 
-Use `github.com/tgdrive/varc` directly when another Go application should own routing, auth, telemetry, or reader wrapping.
+Import `github.com/tgdrive/varc` when your Go application needs a read-through
+disk cache for byte-range-addressable remote content — without running the HTTP
+proxy.
+
+The API is **read-through only**. Varc writes fetched ranges to the local disk
+cache, but it does not expose rclone-style writeback or upload semantics.
+
+### Quick Start
 
 ```go
-package main
+import "github.com/tgdrive/varc"
 
-import (
-    "context"
-    "io"
-    "os"
+cache, err := varc.New(context.Background(), varc.Options{
+    CacheDir: "/tmp/varc-cache",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer cache.Close()
 
-    "github.com/tgdrive/varc"
-)
+// Open a cache-backed reader for a remote object.
+// On first access the content is fetched from upstream.
+reader, err := cache.Open(ctx, "my-cache-key", myRemoteObject)
+if err != nil {
+    log.Fatal(err)
+}
+defer reader.Close()
 
-func main() {
-    cache, err := varc.New(context.Background(), varc.Options{
-        CacheDir: "/tmp/varc-cache",
-    })
-    if err != nil {
-        panic(err)
-    }
-    defer cache.Close()
+// reader implements io.Reader, io.ReaderAt, io.Seeker, io.Closer.
+data, _ := io.ReadAll(reader)
+```
 
-    f, err := os.Open("video.mp4")
-    if err != nil {
-        panic(err)
-    }
-    defer f.Close()
+The returned `varc.Reader` also exposes `Size() int64` and `ModTime() time.Time`.
 
-    info, err := f.Stat()
-    if err != nil {
-        panic(err)
-    }
+### Implementing RemoteObject
 
-    reader, err := cache.OpenReadSeeker(
-        context.Background(),
-        f,
-        varc.WithKey("videos/video.mp4"),
-        varc.WithSize(info.Size()),
-    )
-    if err != nil {
-        panic(err)
-    }
-    defer reader.Close()
+The `RemoteObject` interface is the minimal contract for your upstream source:
 
-    // reader implements io.Reader, io.ReaderAt, io.Seeker, io.Closer, and Size().
-    wrapped := io.LimitReader(reader, 1024)
-    _, _ = io.Copy(io.Discard, wrapped)
+```go
+type RemoteObject interface {
+    Open(ctx context.Context, options ...OpenOption) (io.ReadCloser, error)
+    Size() int64
+    String() string
 }
 ```
 
-You can also use `io.ReaderAt` sources:
+`Open` is called on cache misses. The `RangeOption` (an `OpenOption`) is passed
+to request a specific byte range from the upstream source. Varc uses range
+requests to download content in parallel chunks.
 
 ```go
-reader, err := cache.OpenReaderAt(
-    ctx,
-    readerAt,
-    varc.WithKey("my-cache-key"),
-    varc.WithSize(size),
-    varc.WithFingerprint(etag),
+type MyRemote struct {
+    data   []byte
+    name   string
+    etag   string
+    modAt  time.Time
+}
+
+func (r *MyRemote) Open(ctx context.Context, opts ...varc.OpenOption) (io.ReadCloser, error) {
+    // Default: full range
+    start, end := int64(0), int64(len(r.data)-1)
+    for _, opt := range opts {
+        key, val := opt.Header()
+        if key == "Range" {
+            fmt.Sscanf(val, "bytes=%d-%d", &start, &end)
+        }
+    }
+    if start > int64(len(r.data)) {
+        start = int64(len(r.data))
+    }
+    if end >= int64(len(r.data)) {
+        end = int64(len(r.data) - 1)
+    }
+    if end < start {
+        return io.NopCloser(bytes.NewReader(nil)), nil
+    }
+    return io.NopCloser(bytes.NewReader(r.data[start:end+1])), nil
+}
+
+func (r *MyRemote) Size() int64               { return int64(len(r.data)) }
+func (r *MyRemote) String() string             { return r.name }
+```
+
+#### Optional Interfaces for Cache Validation
+
+When your remote can provide a fingerprint (e.g. ETag, content hash) or
+modification time, implement these interfaces to enable cache invalidation:
+
+```go
+// Fingerprinter invalidates cached data when the fingerprint changes.
+type Fingerprinter interface {
+    Fingerprint() string
+}
+
+// ModTimer preserves the upstream modification time in cache metadata.
+type ModTimer interface {
+    ModTime(ctx context.Context) time.Time
+}
+```
+
+Example:
+
+```go
+type MyRemote struct {
+    // ...
+    fingerprint string
+    modTime     time.Time
+}
+
+func (r *MyRemote) Fingerprint() string                  { return r.fingerprint }
+func (r *MyRemote) ModTime(ctx context.Context) time.Time { return r.modTime }
+```
+
+When a re-open produces the same fingerprint, the cached data is reused without
+re-fetching. When the fingerprint changes, the cache entry is invalidated and
+content is re-downloaded.
+
+### Convenience Source Adapters
+
+Use helper constructors when your data source is a local file, in-memory buffer,
+or any `io.ReadSeeker` / `io.ReaderAt`:
+
+#### OpenReadSeeker (io.ReadSeeker — e.g. *os.File)
+
+```go
+f, _ := os.Open("video.mp4")
+defer f.Close()
+
+reader, err := cache.OpenReadSeeker(ctx, f,
+    varc.WithKey("videos/video.mp4"),
+    varc.WithFingerprint(fingerprint),
 )
 ```
 
-For advanced sources, implement `varc.RemoteObject` directly. Optional interfaces improve cache validation and metadata preservation:
+`WithSize` is optional for `*os.File` — varc calls `f.Stat()` automatically.
+When the source is not a `*os.File`, provide `WithSize` explicitly.
+
+#### OpenReaderAt (io.ReaderAt)
 
 ```go
-type FingerprintedRemote struct{}
-
-func (FingerprintedRemote) Fingerprint() string { return "etag-or-content-hash" }
-func (FingerprintedRemote) ModTime(ctx context.Context) time.Time { return modTime }
+reader, err := cache.OpenReaderAt(ctx, myReaderAt,
+    varc.WithKey("my-cache-key"),
+    varc.WithSize(size),           // required
+    varc.WithFingerprint(etag),
+    varc.WithModTime(modTime),
+)
 ```
 
-The package API is intentionally read-through only. Varc writes downloaded ranges to disk cache, but it does not expose rclone-style writeback/upload semantics.
+#### OpenObject — Full Control
 
-For an HTTP handler adapter, import `github.com/tgdrive/varc/httpcache`:
+When you need to control all parameters in a single struct:
 
 ```go
+reader, err := cache.OpenObject(ctx, varc.Object{
+    Key:         "my-cache-key",
+    Size:        size,
+    Source:      varc.NewReadSeekerSource(readSeeker),
+    Fingerprint: etag,
+    ModTime:     modTime,
+})
+```
+
+### Source Interface
+
+The `Source` interface is what the convenience helpers adapt into:
+
+```go
+type Source interface {
+    OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error)
+}
+```
+
+You can implement `Source` directly and pass it via `Object.Source` rather than
+implementing the full `RemoteObject` interface + `Fingerprinter` / `ModTimer`.
+
+Two built-in adapters:
+
+- `NewReadSeekerSource(src io.ReadSeeker) Source` — wraps `io.ReadSeeker`.
+  Range opens are serialized via an internal mutex since `ReadSeeker` has a
+  shared cursor.
+
+- `NewReaderAtSource(src io.ReaderAt, size int64) Source` — wraps `io.ReaderAt`.
+  Concurrent range opens are safe since each call creates an independent
+  `io.SectionReader`.
+
+### Cache Key Management
+
+Cache keys are hashed with MD5 and optionally sharded into subdirectories for
+filesystem scalability.
+
+```go
+// ShardKey hashes key and applies directory sharding.
+// level=1: "ab/abcdef..."
+// level=2: "ab/cd/abcdef..."
+// level=3: "ab/cd/ef/abcdef..."
+cachePath := varc.ShardKey("https://example.com/video.mp4", 2)
+
+// When Options.ShardLevel > 0, Open / OpenObject automatically shard the key.
+cache, _ := varc.New(ctx, varc.Options{ShardLevel: 2})
+reader, _ := cache.Open(ctx, "https://example.com/video.mp4", remote)
+//                         → cache at "ab/cd/abcdef..."
+```
+
+### Cache Management
+
+```go
+// Shut down the cache — purges, stops background cleaner, cancels context.
+// Always call when the application exits.
+defer cache.Close()
+// Close() is safe to call multiple times — context.CancelFunc is
+// idempotent, os.RemoveAll returns nil for already-deleted paths,
+// and the inUse atomic store is always safe.
+
+// Check if a key exists in cache.
+exists := cache.Exists("my-key")
+
+// Remove a single entry from cache.
+err := cache.Remove("my-key")
+
+// Remove multiple entries.
+cache.Remove("key-a")
+cache.Remove("key-b")
+
+// Cache statistics.
+stats := cache.Stats()
+// map[string]interface{}{
+//   "files":           24,
+//   "bytesUsed":       1048576,
+//   "erroredFiles":    0,
+// }
+```
+
+### Options Reference
+
+```go
+type Options struct {
+    CacheDir          string        // Disk cache root (default: $TMPDIR/varc_cache)
+    ChunkSize         int64         // Chunk size for parallel downloads (default: 128M)
+    ChunkSizeLimit    int64         // Max chunk size; -1 = unlimited (default: -1)
+    ChunkStreams      int           // Parallel download streams (default: 2)
+    CacheMaxAge       time.Duration // Max cache entry age (default: 1h)
+    CacheMaxSize      int64         // Max total cache size; -1 = unlimited (default: -1)
+    CacheMinFreeSpace int64         // Min free disk space; -1 = disabled (default: -1)
+    CachePollInterval time.Duration // Background cleanup interval (default: 1m)
+    ReadAhead         int64         // Read-ahead bytes beyond requested offset (default: 0)
+    FastFingerprint   bool          // Use fast fingerprint mode (default: false)
+    HandleCaching     time.Duration // Handle reuse window (default: 5s)
+    ShardLevel        int           // Hash shard depth; 0 = flat (default: 0)
+    Logger            Logger        // Structured logger; nil = no logging
+}
+```
+
+Zero-valued options are filled from `varc.DefaultOptions()`. Call it to inspect
+production-safe defaults:
+
+```go
+fmt.Println(varc.DefaultOptions().ChunkSize) // 134217728 (128 MiB)
+```
+
+### HTTP Handler Adapter
+
+For an HTTP handler that wraps an upstream URL with varc caching, import
+`github.com/tgdrive/varc/httpcache`:
+
+```go
+import "github.com/tgdrive/varc/httpcache"
+
 handler, err := httpcache.NewHandler(httpcache.Options{
     CacheDir: "/tmp/varc-cache",
 })
+if err != nil {
+    log.Fatal(err)
+}
+http.Handle("/", handler)
 ```
+
+The handler resolves the upstream URL from `?url=` query parameter or a
+base64-encoded path (same routing as the standalone proxy).
 
 ### Building with xcaddy
 

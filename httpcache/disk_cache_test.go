@@ -128,8 +128,8 @@ func TestFullFileCachedOnDisk(t *testing.T) {
 
 	t.Logf("Upstream stats after first read: %s", stats)
 
-	// Should have 1 HEAD (metadata check) + 1 GET (data fetch)
-	assert.Equal(t, int32(1), stats.headCount.Load(), "should do 1 HEAD for metadata check")
+	// Should have 1 HEAD (size discovery) + 1 GET (data fetch)
+	assert.Equal(t, int32(1), stats.headCount.Load(), "should do 1 HEAD for size discovery")
 	assert.Equal(t, int32(1), stats.getTotal.Load(), "should do 1 GET for data fetch")
 
 	// Inspect cache directories
@@ -223,8 +223,8 @@ func TestRangeCachedPartiallyOnDisk(t *testing.T) {
 
 	t.Logf("Upstream stats after range read: %s", stats)
 
-	// Should have 1 HEAD + at least 1 GET (depends on chunk size if full file fetched)
-	assert.Equal(t, int32(1), stats.headCount.Load(), "should do 1 HEAD")
+	// Should have 1 HEAD (size discovery) + 1 GET
+	assert.Equal(t, int32(1), stats.headCount.Load(), "should do 1 HEAD for size discovery")
 
 	// The chunk size is big (128MiB default), so the GET should fetch a single chunk
 	// that covers the whole file
@@ -366,7 +366,7 @@ func TestCacheReuseDataNoExtraGets(t *testing.T) {
 	assert.Equal(t, data, body1)
 	t.Logf("After 1st full read: %s", stats)
 
-	// At this point: 1 HEAD (metadata check) + 1 GET (data) = 2 upstream calls
+	// At this point: 1 HEAD (size discovery) + 1 GET (data) = 2 upstream calls
 	assert.Equal(t, int32(1), stats.headCount.Load())
 	assert.Equal(t, int32(1), stats.getTotal.Load())
 
@@ -378,11 +378,11 @@ func TestCacheReuseDataNoExtraGets(t *testing.T) {
 	assert.Equal(t, data, body2)
 	t.Logf("After 2nd full read: %s", stats)
 
-	// HEAD counter goes up (metadata stale check), but no new GET
-	assert.Equal(t, int32(2), stats.headCount.Load(), "HEAD for metadata check on each open")
+	// No new HEAD or GET — served entirely from cache
+	assert.Equal(t, int32(1), stats.headCount.Load(), "only 1 HEAD for first request, cache hits don't need HEAD")
 	assert.Equal(t, int32(1), stats.getTotal.Load(), "data should be served from cache, no additional GET")
 
-	// Third request: range — data should also come from cache
+	// Third request: range — data should also come from cache (no new HEAD or GET)
 	req, _ := http.NewRequest("GET", proxy.URL, nil)
 	req.Header.Set("Range", "bytes=5-14")
 	resp, err = http.DefaultClient.Do(req)
@@ -392,7 +392,7 @@ func TestCacheReuseDataNoExtraGets(t *testing.T) {
 	assert.Equal(t, data[5:15], body3)
 	t.Logf("After range read: %s", stats)
 
-	assert.Equal(t, int32(3), stats.headCount.Load(), "HEAD for metadata check on each open")
+	assert.Equal(t, int32(1), stats.headCount.Load(), "still only 1 HEAD total")
 	assert.Equal(t, int32(1), stats.getTotal.Load(), "range data should also come from cache")
 }
 

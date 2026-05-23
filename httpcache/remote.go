@@ -5,34 +5,84 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"sync"
 	"time"
 
-	"github.com/tgdrive/varc/internal/types"
+	"github.com/tgdrive/varc"
 )
 
-// Compile-time check that remoteFile implements RemoteObject
-var _ types.RemoteObject = (*remoteFile)(nil)
+// Compile-time check that remoteFile implements varc.RemoteObject
+var _ varc.RemoteObject = (*remoteFile)(nil)
 
 // remoteFile is an HTTP-backed RemoteObject used by the proxy
 // to fetch files from upstream URLs through the disk cache.
 type remoteFile struct {
-	url     string
-	headers http.Header
-	size    int64
-	modTime time.Time
-	etag    string
-	client  *http.Client
+	url           string
+	headers       http.Header
+	size          int64
+	modTime       time.Time
+	etag          string
+	client        *http.Client
+	discovered    bool
+	discoverOnce  sync.Once
+	discoverErr   error
 }
 
-func newHTTPFile(url string, headers http.Header, size int64, modTime time.Time, etag string, client *http.Client) *remoteFile {
+func newHTTPFile(url string, headers http.Header, client *http.Client) *remoteFile {
 	return &remoteFile{
 		url:     url,
 		headers: headers,
-		size:    size,
-		modTime: modTime,
-		etag:    etag,
+		size:    -1,
 		client:  client,
 	}
+}
+
+// Discover makes a HEAD request to determine the file's size, mod time, and ETag.
+// It is safe to call multiple times. After this method returns successfully,
+// Size() will return the discovered content length.
+//
+// Discover must be called before passing the remoteFile to the cache engine,
+// because the engine cannot handle unknown (-1) sizes.
+func (f *remoteFile) Discover() error {
+	f.discoverOnce.Do(func() {
+		req, err := http.NewRequest("HEAD", f.url, nil)
+		if err != nil {
+			f.discoverErr = fmt.Errorf("remoteFile.Discover: %w", err)
+			return
+		}
+		for k, vv := range f.headers {
+			for _, v := range vv {
+				req.Header.Add(k, v)
+			}
+		}
+		resp, err := f.client.Do(req)
+		if err != nil {
+			f.discoverErr = fmt.Errorf("remoteFile.Discover: %w", err)
+			return
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			f.discoverErr = fmt.Errorf("remoteFile.Discover: HEAD returned status %d", resp.StatusCode)
+			return
+		}
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			if sz, err := strconv.ParseInt(cl, 10, 64); err == nil {
+				f.size = sz
+			}
+		}
+		if lm := resp.Header.Get("Last-Modified"); lm != "" {
+			if t, err := http.ParseTime(lm); err == nil {
+				f.modTime = t
+			}
+		}
+		if etag := resp.Header.Get("ETag"); etag != "" {
+			f.etag = etag
+		}
+		f.discovered = true
+	})
+	return f.discoverErr
 }
 
 // String returns the upstream URL
@@ -62,8 +112,8 @@ func (f *remoteFile) ModTime(ctx context.Context) time.Time {
 }
 
 // Open opens the remote file for reading, supporting Range requests
-// via types.RangeOption.
-func (f *remoteFile) Open(ctx context.Context, options ...types.OpenOption) (io.ReadCloser, error) {
+// via varc.RangeOption.
+func (f *remoteFile) Open(ctx context.Context, options ...varc.OpenOption) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("remoteFile.Open: %w", err)

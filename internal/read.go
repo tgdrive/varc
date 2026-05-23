@@ -40,17 +40,25 @@ func newReadFileHandle(f *File) (*ReadFileHandle, error) {
 		return nil, fmt.Errorf("failed to get cache item for %s", cachePath)
 	}
 
-	// Open the cache item with the remote object if available
+	// If there is no cached data on disk and no remote to fill it, fail fast.
+	// This handles the case where the cache was explicitly purged (e.g. via
+	// PURGE/Remove) but the file tree node still exists from a previous open.
+	if !item.Exists() && f.remote == nil {
+		return nil, fmt.Errorf("cache read: no cached data for %s", cachePath)
+	}
+
+	// Open the cache item (creates the file descriptor). If a remote
+	// object is available, it will be used to fill cache misses; otherwise
+	// the file serves only cached data.
+	if err := item.Open(f.remote); err != nil {
+		return nil, fmt.Errorf("cache read: failed to open cache item: %w", err)
+	}
 	if f.remote != nil {
-		err := item.Open(f.remote)
-		if err != nil {
-			return nil, fmt.Errorf("cache read: failed to open cache item: %w", err)
-		}
 		h.size = f.remote.Size()
 	}
 
-	// Get size from cache item
-	if sz, err := item.GetSize(); err == nil {
+	// Get size from cache item (overrides -1 from remote if unknown)
+	if sz, err := item.GetSize(); err == nil && sz >= 0 {
 		h.size = sz
 	}
 
