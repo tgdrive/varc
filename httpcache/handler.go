@@ -59,16 +59,16 @@ func (m *Metrics) add(field *int64, n int64) {
 
 // Options holds configuration for the cache proxy handler
 type Options struct {
-	CacheDir          string       `caddy:"cache_dir"`
-	CacheMaxAge       string       `caddy:"max_age"`
-	CacheMaxSize      string       `caddy:"max_size"`
-	CacheChunkSize    string       `caddy:"chunk_size"`
-	CacheChunkStreams int          `caddy:"chunk_streams"`
-	StripQuery        bool         `caddy:"strip_query"`
-	StripDomain       bool         `caddy:"strip_domain"`
-	ShardLevel        int          `caddy:"shard_level"`
-	Passthrough       bool         `caddy:"passthrough"`
-	Logger            varc.Logger  `caddy:"-"`
+	CacheDir          string      `caddy:"cache_dir"`
+	CacheMaxAge       string      `caddy:"max_age"`
+	CacheMaxSize      string      `caddy:"max_size"`
+	CacheChunkSize    string      `caddy:"chunk_size"`
+	CacheChunkStreams int         `caddy:"chunk_streams"`
+	StripQuery        bool        `caddy:"strip_query"`
+	StripDomain       bool        `caddy:"strip_domain"`
+	ShardLevel        int         `caddy:"shard_level"`
+	Passthrough       bool        `caddy:"passthrough"`
+	Logger            varc.Logger `caddy:"-"`
 }
 
 // DefaultOptions returns Options with sensible defaults
@@ -81,10 +81,10 @@ func DefaultOptions() Options {
 
 // Handler is the cache proxy HTTP handler
 type Handler struct {
-	cache       *varc.Cache
-	client      *http.Client
-	metrics     *Metrics
-	logger      varc.Logger
+	cache   *varc.Cache
+	client  *http.Client
+	metrics *Metrics
+	logger  varc.Logger
 
 	stripQuery  bool
 	stripDomain bool
@@ -102,10 +102,10 @@ func NewHandler(opt Options) (*Handler, error) {
 	}
 
 	varcOpt := varc.Options{
-		CacheDir:          cacheDir,
-		ChunkStreams:      opt.CacheChunkStreams,
-		ShardLevel:        opt.ShardLevel,
-		Logger:            opt.Logger,
+		CacheDir:     cacheDir,
+		ChunkStreams: opt.CacheChunkStreams,
+		ShardLevel:   opt.ShardLevel,
+		Logger:       opt.Logger,
 	}
 
 	if opt.CacheMaxAge != "" {
@@ -303,7 +303,7 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 
 	h.metrics.inc(&h.metrics.Requests)
 
-	var reader varc.Reader
+	var reader *varc.Reader
 	var openErr error
 
 	// Check if the file is already cached. If so, we can serve it without
@@ -311,7 +311,7 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 	// file stat on disk.
 	if h.cache.Exists(keyURL) {
 		h.metrics.inc(&h.metrics.Hits)
-		reader, openErr = h.cache.Open(context.Background(), keyURL, nil)
+		reader, openErr = h.cache.Open(context.Background(), keyURL, -1, nil)
 	} else {
 		h.metrics.inc(&h.metrics.Misses)
 		// Discover file metadata via HEAD (the cache engine requires known sizes).
@@ -321,7 +321,10 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 			http.Error(w, "Failed to discover file: "+err.Error(), http.StatusBadGateway)
 			return
 		}
-		reader, openErr = h.cache.Open(context.Background(), keyURL, httpFile)
+		reader, openErr = h.cache.Open(context.Background(), keyURL, httpFile.Size(), httpFile,
+			varc.WithFingerprint(httpFile.Fingerprint()),
+			varc.WithModTime(httpFile.ModTime(context.Background())),
+		)
 	}
 	if openErr != nil {
 		http.Error(w, "Failed to open file: "+openErr.Error(), http.StatusInternalServerError)

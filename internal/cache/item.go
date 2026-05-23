@@ -718,8 +718,13 @@ func (item *Item) _checkObject(o types.RemoteObject) error {
 		remoteFingerprint := _fingerprint(o, item.c.opt.FastFingerprint)
 		item.c.opt.Logger.Debugf("%s: cache: checking remote fingerprint %q against cached fingerprint %q", item.name, remoteFingerprint, item.info.Fingerprint)
 		if remoteFingerprint == "" {
-			// Source has no validator. Keep existing cached data rather than
-			// repeatedly invalidating entries whose previous source had one.
+			// Source has no validator. Size is the only safe signal available:
+			// reuse same-size entries, invalidate changed-size entries.
+			if item._exists() && item.info.Size >= 0 && o.Size() >= 0 && item.info.Size != o.Size() {
+				item.c.opt.Logger.Debugf("%s: cache: removing cached entry as stale (remote size %d != cached size %d)", item.name, o.Size(), item.info.Size)
+				item._remove("stale (remote size changed)")
+				item.info.Size = o.Size()
+			}
 		} else if item.info.Fingerprint != "" {
 			// remote object && local object
 			if remoteFingerprint != item.info.Fingerprint {
@@ -730,8 +735,12 @@ func (item *Item) _checkObject(o types.RemoteObject) error {
 			}
 			// Fingerprints match — keep existing cached data and size.
 		} else {
-			// remote object && no local object
-			// Set fingerprint and size from the remote
+			if item._exists() {
+				item.c.opt.Logger.Debugf("%s: cache: removing cached entry because remote has fingerprint %q but cached entry has none", item.name, remoteFingerprint)
+				item._remove("stale (cached entry has no fingerprint)")
+			}
+			// remote object && no local fingerprint
+			// Set fingerprint and size from the remote.
 			item.info.Fingerprint = remoteFingerprint
 			item.info.Size = o.Size()
 		}

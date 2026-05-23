@@ -140,170 +140,88 @@ if err != nil {
 }
 defer cache.Close()
 
-// Open a cache-backed reader for a remote object.
-// On first access the content is fetched from upstream.
-reader, err := cache.Open(ctx, "my-cache-key", myRemoteObject)
+// Open a cache-backed reader for any io.ReaderAt source.
+// On first access, only missing chunks are fetched from upstream.
+reader, err := cache.Open(ctx, "my-cache-key", size, myReaderAt,
+    varc.WithFingerprint(etag),
+    varc.WithModTime(modTime),
+)
 if err != nil {
     log.Fatal(err)
 }
 defer reader.Close()
 
-// reader implements io.Reader, io.ReaderAt, io.Seeker, io.Closer.
-data, _ := io.ReadAll(reader)
+// Reader implements io.Reader, io.ReaderAt, io.Seeker, io.Closer.
+section := io.NewSectionReader(reader, rangeStart, rangeLength)
+_, _ = io.Copy(responseWriter, section)
 ```
 
 The returned `varc.Reader` also exposes `Size() int64` and `ModTime() time.Time`.
 
-### Implementing RemoteObject
+### Source Contract
 
-The `RemoteObject` interface is the minimal contract for your upstream source:
+Varc only needs `io.ReaderAt` from upstream sources:
 
 ```go
-type RemoteObject interface {
-    Open(ctx context.Context, options ...OpenOption) (io.ReadCloser, error)
-    Size() int64
-    String() string
+type ReaderAt interface {
+    ReadAt(p []byte, off int64) (n int, err error)
 }
 ```
 
-`Open` is called on cache misses. The `RangeOption` (an `OpenOption`) is passed
-to request a specific byte range from the upstream source. Varc uses range
-requests to download content in parallel chunks.
+When a player requests `bytes=1048576-1056767`, call `Open` once and serve that
+range with `io.NewSectionReader`. Varc checks the local sparse cache and calls
+your source's `ReadAt` only for missing chunks.
 
 ```go
-type MyRemote struct {
-    data   []byte
-    name   string
-    etag   string
-    modAt  time.Time
+type TelegramFile struct {
+    // fields needed to fetch Telegram chunks
 }
 
-func (r *MyRemote) Open(ctx context.Context, opts ...varc.OpenOption) (io.ReadCloser, error) {
-    // Default: full range
-    start, end := int64(0), int64(len(r.data)-1)
-    for _, opt := range opts {
-        key, val := opt.Header()
-        if key == "Range" {
-            fmt.Sscanf(val, "bytes=%d-%d", &start, &end)
-        }
-    }
-    if start > int64(len(r.data)) {
-        start = int64(len(r.data))
-    }
-    if end >= int64(len(r.data)) {
-        end = int64(len(r.data) - 1)
-    }
-    if end < start {
-        return io.NopCloser(bytes.NewReader(nil)), nil
-    }
-    return io.NopCloser(bytes.NewReader(r.data[start:end+1])), nil
-}
-
-func (r *MyRemote) Size() int64               { return int64(len(r.data)) }
-func (r *MyRemote) String() string             { return r.name }
-```
-
-#### Optional Interfaces for Cache Validation
-
-When your remote can provide a fingerprint (e.g. ETag, content hash) or
-modification time, implement these interfaces to enable cache invalidation:
-
-```go
-// Fingerprinter invalidates cached data when the fingerprint changes.
-type Fingerprinter interface {
-    Fingerprint() string
-}
-
-// ModTimer preserves the upstream modification time in cache metadata.
-type ModTimer interface {
-    ModTime(ctx context.Context) time.Time
+func (f *TelegramFile) ReadAt(p []byte, off int64) (int, error) {
+    // Fetch exactly len(p) bytes starting at off from Telegram.
+    // Return io.EOF only for short reads at the end of the file.
+    return fetchTelegramRange(p, off)
 }
 ```
 
-Example:
+### Cache Validation
+
+Pass validation metadata as options:
 
 ```go
-type MyRemote struct {
-    // ...
-    fingerprint string
-    modTime     time.Time
-}
-
-func (r *MyRemote) Fingerprint() string                  { return r.fingerprint }
-func (r *MyRemote) ModTime(ctx context.Context) time.Time { return r.modTime }
-```
-
-When a re-open produces the same fingerprint, the cached data is reused without
-re-fetching. When the fingerprint changes, the cache entry is invalidated and
-content is re-downloaded.
-
-### Convenience Source Adapters
-
-Use helper constructors when your data source is a local file, in-memory buffer,
-or any `io.ReadSeeker` / `io.ReaderAt`:
-
-#### OpenReadSeeker (io.ReadSeeker — e.g. *os.File)
-
-```go
-f, _ := os.Open("video.mp4")
-defer f.Close()
-
-reader, err := cache.OpenReadSeeker(ctx, f,
-    varc.WithKey("videos/video.mp4"),
-    varc.WithFingerprint(fingerprint),
+reader, err := cache.Open(ctx, key, size, src,
+    varc.WithFingerprint(etagOrContentHash),
+    varc.WithModTime(updatedAt),
 )
 ```
 
-`WithSize` is optional for `*os.File` — varc calls `f.Stat()` automatically.
-When the source is not a `*os.File`, provide `WithSize` explicitly.
+Rules:
 
-#### OpenReaderAt (io.ReaderAt)
+- Same fingerprint: cached ranges are reused.
+- Changed fingerprint: cached data and metadata are invalidated.
+- No fingerprint, same size: cached ranges are reused because varc cannot prove content changed.
+- No fingerprint, changed size: cached data is invalidated.
 
-```go
-reader, err := cache.OpenReaderAt(ctx, myReaderAt,
-    varc.WithKey("my-cache-key"),
-    varc.WithSize(size),           // required
-    varc.WithFingerprint(etag),
-    varc.WithModTime(modTime),
-)
+`WithModTime` preserves the upstream modification time on `Reader.ModTime()`.
+
+### Playback / Seeking Behavior
+
+For a media player:
+
+```text
+read 0-8191          -> source ReadAt for missing chunk(s), writes cache
+read 0-8191 again    -> disk cache hit, no source call
+seek to 1 MiB        -> source ReadAt for missing chunk(s) near 1 MiB
+seek back to 0       -> disk cache hit, no source call
 ```
 
-#### OpenObject — Full Control
-
-When you need to control all parameters in a single struct:
+Use standard library section readers for HTTP ranges:
 
 ```go
-reader, err := cache.OpenObject(ctx, varc.Object{
-    Key:         "my-cache-key",
-    Size:        size,
-    Source:      varc.NewReadSeekerSource(readSeeker),
-    Fingerprint: etag,
-    ModTime:     modTime,
-})
+cached, err := cache.Open(ctx, key, size, source, varc.WithFingerprint(etag))
+section := io.NewSectionReader(cached, start, length)
+_, err = io.Copy(w, section)
 ```
-
-### Source Interface
-
-The `Source` interface is what the convenience helpers adapt into:
-
-```go
-type Source interface {
-    OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error)
-}
-```
-
-You can implement `Source` directly and pass it via `Object.Source` rather than
-implementing the full `RemoteObject` interface + `Fingerprinter` / `ModTimer`.
-
-Two built-in adapters:
-
-- `NewReadSeekerSource(src io.ReadSeeker) Source` — wraps `io.ReadSeeker`.
-  Range opens are serialized via an internal mutex since `ReadSeeker` has a
-  shared cursor.
-
-- `NewReaderAtSource(src io.ReaderAt, size int64) Source` — wraps `io.ReaderAt`.
-  Concurrent range opens are safe since each call creates an independent
-  `io.SectionReader`.
 
 ### Cache Key Management
 
@@ -317,9 +235,9 @@ filesystem scalability.
 // level=3: "ab/cd/ef/abcdef..."
 cachePath := varc.ShardKey("https://example.com/video.mp4", 2)
 
-// When Options.ShardLevel > 0, Open / OpenObject automatically shard the key.
+// When Options.ShardLevel > 0, Open automatically shards the key.
 cache, _ := varc.New(ctx, varc.Options{ShardLevel: 2})
-reader, _ := cache.Open(ctx, "https://example.com/video.mp4", remote)
+reader, _ := cache.Open(ctx, "https://example.com/video.mp4", size, source)
 //                         → cache at "ab/cd/abcdef..."
 ```
 

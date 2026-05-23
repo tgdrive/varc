@@ -1,25 +1,22 @@
-// Package varc provides an importable read-through range cache.
-//
-// It is designed for applications that want rclone-derived sparse range
-// caching without running the HTTP proxy. Implement RemoteObject for your
-// upstream source, then call Cache.Open to get a reader backed by the local
-// disk cache.
+// Package varc provides a small read-through disk cache for io.ReaderAt
+// sources. It is built for media/range workloads: callers read byte ranges,
+// varc fetches missing chunks from the source, stores them on disk, and serves
+// repeated reads from the local cache.
 package varc
 
 import (
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/tgdrive/varc/internal"
-	"github.com/tgdrive/varc/internal/types"
 )
 
 const mebi = 1048576
@@ -32,112 +29,31 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
-// OpenOption configures a remote object open. RangeOption is the standard option.
-type OpenOption interface {
-	Header() (key, value string)
-}
+// OpenOption configures metadata for a cache entry.
+type OpenOption func(*openOptions)
 
-// RangeOption requests a byte range from a RemoteObject.
-type RangeOption struct {
-	Start int64
-	End   int64
-}
-
-// Header returns the HTTP Range header represented by the option.
-func (o RangeOption) Header() (key, value string) {
-	return (&types.RangeOption{Start: o.Start, End: o.End}).Header()
-}
-
-// RemoteObject is the minimal upstream object contract varc needs to fill cache misses.
-type RemoteObject interface {
-	Open(ctx context.Context, options ...OpenOption) (io.ReadCloser, error)
-	Size() int64
-	String() string
-}
-
-// Fingerprinter can be implemented by RemoteObject to invalidate stale cache entries.
-type Fingerprinter interface {
-	Fingerprint() string
-}
-
-// ModTimer can be implemented by RemoteObject to preserve upstream modification time.
-type ModTimer interface {
-	ModTime(ctx context.Context) time.Time
-}
-
-// Source can open an arbitrary byte range from an upstream object.
-// End is inclusive. If end is negative, the range continues to EOF.
-type Source interface {
-	OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error)
-}
-
-// Object describes a cacheable object and its custom cache key.
-type Object struct {
-	Key         string
-	Size        int64
-	Source      Source
-	Fingerprint string
-	ModTime     time.Time
-}
-
-// ObjectOption configures Object helpers like OpenReadSeeker.
-type ObjectOption func(*Object)
-
-// WithKey sets the cache key used on disk.
-func WithKey(key string) ObjectOption {
-	return func(obj *Object) { obj.Key = key }
-}
-
-// WithSize sets the object size. This is required for generic seekable sources.
-func WithSize(size int64) ObjectOption {
-	return func(obj *Object) { obj.Size = size }
+type openOptions struct {
+	fingerprint string
+	modTime     time.Time
 }
 
 // WithFingerprint sets a stable content fingerprint such as an ETag or hash.
-func WithFingerprint(fingerprint string) ObjectOption {
-	return func(obj *Object) { obj.Fingerprint = fingerprint }
+// Changing the fingerprint invalidates stale cached data for the same key.
+func WithFingerprint(fingerprint string) OpenOption {
+	return func(o *openOptions) { o.fingerprint = fingerprint }
 }
 
-// WithModTime sets the object's modification time.
-func WithModTime(modTime time.Time) ObjectOption {
-	return func(obj *Object) { obj.ModTime = modTime }
+// WithModTime preserves the upstream modification time on the cache file.
+func WithModTime(modTime time.Time) OpenOption {
+	return func(o *openOptions) { o.modTime = modTime }
 }
 
-// Reader is a cache-backed reader. It can be wrapped with standard io decorators.
-type Reader interface {
-	io.Reader
-	io.ReaderAt
-	io.Seeker
-	io.Closer
-	Size() int64
-	ModTime() time.Time
-}
-
-// ShardKey hashes key with MD5 and optionally applies directory sharding.
-//
-// If level <= 0, the hex MD5 hash is returned as-is.
-// If level > 0, the hash is split into level subdirectory pairs.
-// For example, ShardKey("https://example.com/file", 2) might return "ab/cd/abcdef...".
-//
-// The core cache transparently creates the subdirectories on disk via
-// createItemDir, so sharded keys work with any Cache operation.
-func ShardKey(key string, level int) string {
-	hash := fmt.Sprintf("%x", md5.Sum([]byte(key)))
-	if level <= 0 {
-		return hash
-	}
-	var b strings.Builder
-	for i := 0; i < level && i*2 < len(hash); i++ {
-		b.WriteString(hash[i*2 : i*2+2])
-		b.WriteByte('/')
-	}
-	b.WriteString(hash)
-	return b.String()
-}
-
-// Options configures Cache.
+// Options configures Cache. ChunkSize, CacheDir, and ShardLevel are the core
+// options used by the simple ReaderAt cache. Other fields are kept so existing
+// config structs do not need churn while the API is simplified.
 type Options struct {
 	CacheDir          string
+	BlockSize         int64
 	ChunkSize         int64
 	ChunkSizeLimit    int64
 	ChunkStreams      int
@@ -156,6 +72,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		CacheDir:          filepath.Join(os.TempDir(), "varc_cache"),
+		BlockSize:         mebi,
 		ChunkSize:         128 * mebi,
 		ChunkSizeLimit:    -1,
 		ChunkStreams:      2,
@@ -167,369 +84,603 @@ func DefaultOptions() Options {
 	}
 }
 
-// Cache is an importable read-through range cache.
+// Cache is a sparse, read-through range cache.
 type Cache struct {
-	engine     *internal.Engine
-	shardLevel int
+	dir         string
+	blockSize   int64
+	chunkSize   int64
+	shardLevel  int
+	mu          sync.Mutex
+	cond        *sync.Cond
+	downloaders map[string][]*downloader
+}
+
+// Reader is a cache-backed reader returned by Cache.Open.
+type Reader struct {
+	cache  *Cache
+	key    string
+	path   string
+	meta   cacheMeta
+	src    io.ReaderAt
+	pos    int64
+	closed bool
+	readMu sync.Mutex
+}
+
+type downloader struct {
+	owner  *Reader
+	path   string
+	src    io.ReaderAt
+	start  int64
+	end    int64
+	offset int64
+	done   bool
+	cancel bool
+	err    error
+	doneCh chan struct{}
+}
+
+type cacheMeta struct {
+	Size        int64       `json:"size"`
+	Fingerprint string      `json:"fingerprint,omitempty"`
+	ModTime     time.Time   `json:"mod_time,omitempty"`
+	Ranges      []byteRange `json:"ranges,omitempty"`
+}
+
+type byteRange struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
+// ShardKey hashes key with MD5 and optionally applies directory sharding.
+func ShardKey(key string, level int) string {
+	hash := fmt.Sprintf("%x", md5.Sum([]byte(key)))
+	if level <= 0 {
+		return hash
+	}
+	var b strings.Builder
+	for i := 0; i < level && i*2 < len(hash); i++ {
+		b.WriteString(hash[i*2 : i*2+2])
+		b.WriteByte('/')
+	}
+	b.WriteString(hash)
+	return b.String()
 }
 
 // New creates a Cache. Zero-valued options are filled from DefaultOptions.
 func New(ctx context.Context, opt Options) (*Cache, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	_ = ctx
 	merged := mergeOptions(DefaultOptions(), opt)
-	engOpt := types.Options{
-		ChunkSize:         merged.ChunkSize,
-		ChunkSizeLimit:    merged.ChunkSizeLimit,
-		ChunkStreams:      merged.ChunkStreams,
-		CacheMaxAge:       merged.CacheMaxAge,
-		CacheMaxSize:      merged.CacheMaxSize,
-		CacheMinFreeSpace: merged.CacheMinFreeSpace,
-		CachePollInterval: merged.CachePollInterval,
-		ReadAhead:         merged.ReadAhead,
-		FastFingerprint:   merged.FastFingerprint,
-		HandleCaching:     merged.HandleCaching,
-		CacheDir:          merged.CacheDir,
-		Logger:            merged.Logger,
+	if merged.BlockSize <= 0 {
+		merged.BlockSize = mebi
 	}
-	engOpt.Init()
-
-	engine, err := internal.New(ctx, &engOpt)
-	if err != nil {
-		return nil, err
+	if merged.ChunkSize <= 0 {
+		merged.ChunkSize = 128 * mebi
 	}
-	return &Cache{engine: engine, shardLevel: merged.ShardLevel}, nil
+	if merged.BlockSize > merged.ChunkSize {
+		merged.BlockSize = merged.ChunkSize
+	}
+	if err := os.MkdirAll(merged.CacheDir, 0o700); err != nil {
+		return nil, fmt.Errorf("varc: create cache dir: %w", err)
+	}
+	c := &Cache{
+		dir:         merged.CacheDir,
+		blockSize:   merged.BlockSize,
+		chunkSize:   merged.ChunkSize,
+		shardLevel:  merged.ShardLevel,
+		downloaders: make(map[string][]*downloader),
+	}
+	c.cond = sync.NewCond(&c.mu)
+	return c, nil
 }
 
-// Open opens key from the local cache, filling cache misses from obj.
-// Pass obj=nil for cache-only reads.
-// If Options.ShardLevel > 0, the key is automatically sharded via ShardKey.
-func (c *Cache) Open(ctx context.Context, key string, obj RemoteObject) (Reader, error) {
-	if ctx == nil {
-		ctx = context.Background()
+// Open opens key from the local cache, filling cache misses from src.
+//
+// If src is nil, Open is cache-only: it can read already cached ranges but
+// cannot fill missing ranges. If src is non-nil, size must be >= 0.
+func (c *Cache) Open(ctx context.Context, key string, size int64, src io.ReaderAt, opts ...OpenOption) (*Reader, error) {
+	_ = ctx
+	if key == "" {
+		return nil, errors.New("varc: key is required")
 	}
-	cacheKey := ShardKey(key, c.shardLevel)
-	h, err := c.engine.OpenCached(cacheKey, adaptRemote(obj))
-	if err != nil {
-		return nil, err
+	if src != nil && size < 0 {
+		return nil, errors.New("varc: size must be known when source is provided")
 	}
-	sizer, _ := h.(interface{ Size() int64 })
-	return &cacheReader{handle: h, sizer: sizer}, nil
-}
 
-// OpenObject opens obj using obj.Key as the cache key.
-// If Options.ShardLevel > 0, the key is automatically sharded via ShardKey.
-func (c *Cache) OpenObject(ctx context.Context, obj Object) (Reader, error) {
-	if obj.Key == "" {
-		return nil, errors.New("varc: object key is required")
-	}
-	if obj.Source == nil {
-		return nil, errors.New("varc: object source is required")
-	}
-	if obj.Size < 0 {
-		return nil, errors.New("varc: object size must be known")
-	}
-	return c.Open(ctx, obj.Key, adaptObject(obj))
-}
-
-// OpenReadSeeker opens a cache-backed reader from any io.ReadSeeker.
-// Use WithKey and WithSize unless src also implements Stat() (for example *os.File).
-func (c *Cache) OpenReadSeeker(ctx context.Context, src io.ReadSeeker, opts ...ObjectOption) (Reader, error) {
-	if src == nil {
-		return nil, errors.New("varc: read seeker source is required")
-	}
-	obj := Object{Size: -1, Source: NewReadSeekerSource(src)}
-	applyObjectOptions(&obj, opts)
-	if obj.Size < 0 {
-		if statter, ok := src.(interface{ Stat() (os.FileInfo, error) }); ok {
-			fi, err := statter.Stat()
-			if err != nil {
-				return nil, fmt.Errorf("varc: stat read seeker: %w", err)
-			}
-			obj.Size = fi.Size()
+	var openOpt openOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&openOpt)
 		}
 	}
-	return c.OpenObject(ctx, obj)
-}
 
-// OpenReaderAt opens a cache-backed reader from any io.ReaderAt.
-func (c *Cache) OpenReaderAt(ctx context.Context, src io.ReaderAt, opts ...ObjectOption) (Reader, error) {
+	path := filepath.Join(c.dir, ShardKey(key, c.shardLevel))
+	metaPath := path + ".meta"
+	c.mu.Lock()
+	meta, metaExists, err := loadMeta(metaPath)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+
 	if src == nil {
-		return nil, errors.New("varc: reader-at source is required")
+		if !metaExists || !fileExists(path) {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("varc: cache miss for %q", key)
+		}
+		size = meta.Size
+	} else {
+		stale := !metaExists || !fileExists(path)
+		if !stale && openOpt.fingerprint != "" && meta.Fingerprint != openOpt.fingerprint {
+			stale = true
+		}
+		if !stale && openOpt.fingerprint == "" && meta.Fingerprint == "" && meta.Size != size {
+			stale = true
+		}
+		if stale {
+			c.cancelDownloadersLocked(path)
+			_ = os.Remove(path)
+			_ = os.Remove(metaPath)
+			meta = cacheMeta{Size: size, Fingerprint: openOpt.fingerprint, ModTime: openOpt.modTime}
+		} else {
+			meta.Size = size
+			if openOpt.fingerprint != "" {
+				meta.Fingerprint = openOpt.fingerprint
+			}
+			if !openOpt.modTime.IsZero() {
+				meta.ModTime = openOpt.modTime
+			}
+		}
 	}
-	obj := Object{Size: -1}
-	applyObjectOptions(&obj, opts)
-	if obj.Size < 0 {
-		return nil, errors.New("varc: WithSize is required for ReaderAt sources")
+
+	if meta.Size < 0 {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("varc: unknown size for %q", key)
 	}
-	obj.Source = NewReaderAtSource(src, obj.Size)
-	return c.OpenObject(ctx, obj)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("varc: create cache key dir: %w", err)
+	}
+	if err := saveMeta(metaPath, meta); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	if !meta.ModTime.IsZero() && fileExists(path) {
+		_ = os.Chtimes(path, meta.ModTime, meta.ModTime)
+	}
+	c.mu.Unlock()
+
+	return &Reader{cache: c, key: key, path: path, meta: meta, src: src}, nil
 }
 
 // Exists checks whether key has an existing cache file on disk.
 func (c *Cache) Exists(key string) bool {
-	cacheKey := ShardKey(key, c.shardLevel)
-	return c.engine.Exists(cacheKey)
+	path := filepath.Join(c.dir, ShardKey(key, c.shardLevel))
+	return fileExists(path) && fileExists(path+".meta")
 }
 
 // Remove evicts key from the cache.
 func (c *Cache) Remove(key string) error {
-	cacheKey := ShardKey(key, c.shardLevel)
-	return c.engine.Remove(cacheKey)
-}
-
-// Stats returns cache statistics.
-func (c *Cache) Stats() map[string]interface{} {
-	return c.engine.Stats()
-}
-
-// Close shuts down the cache and background cleaner.
-func (c *Cache) Close() error {
-	return c.engine.Close()
-}
-
-type cacheReader struct {
-	handle internal.Handle
-	sizer  interface{ Size() int64 }
-}
-
-type objectRemote struct {
-	object Object
-}
-
-func (o objectRemote) Open(ctx context.Context, options ...OpenOption) (io.ReadCloser, error) {
-	start, end := int64(0), int64(-1)
-	for _, option := range options {
-		key, value := option.Header()
-		if strings.EqualFold(key, "Range") {
-			parsedStart, parsedEnd, err := parseRangeHeader(value)
-			if err != nil {
-				return nil, err
-			}
-			start, end = parsedStart, parsedEnd
-		}
+	path := filepath.Join(c.dir, ShardKey(key, c.shardLevel))
+	c.mu.Lock()
+	c.cancelDownloadersLocked(path)
+	c.mu.Unlock()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	return o.object.Source.OpenRange(ctx, start, end)
-}
-
-func (o objectRemote) Size() int64 { return o.object.Size }
-
-func (o objectRemote) String() string { return o.object.Key }
-
-type objectRemoteFingerprint struct{ objectRemote }
-
-func (o objectRemoteFingerprint) Fingerprint() string { return o.object.Fingerprint }
-
-type objectRemoteModTime struct{ objectRemote }
-
-func (o objectRemoteModTime) ModTime(ctx context.Context) time.Time { return o.object.ModTime }
-
-type objectRemoteFingerprintModTime struct{ objectRemote }
-
-func (o objectRemoteFingerprintModTime) Fingerprint() string { return o.object.Fingerprint }
-
-func (o objectRemoteFingerprintModTime) ModTime(ctx context.Context) time.Time {
-	return o.object.ModTime
-}
-
-func adaptObject(obj Object) RemoteObject {
-	base := objectRemote{object: obj}
-	hasFingerprint := obj.Fingerprint != ""
-	hasModTime := !obj.ModTime.IsZero()
-	switch {
-	case hasFingerprint && hasModTime:
-		return objectRemoteFingerprintModTime{objectRemote: base}
-	case hasFingerprint:
-		return objectRemoteFingerprint{objectRemote: base}
-	case hasModTime:
-		return objectRemoteModTime{objectRemote: base}
-	default:
-		return base
+	if err := os.Remove(path + ".meta"); err != nil && !os.IsNotExist(err) {
+		return err
 	}
-}
-
-type readSeekerSource struct {
-	mu  sync.Mutex
-	src io.ReadSeeker
-}
-
-// NewReadSeekerSource adapts any io.ReadSeeker into a Source.
-// Range opens are serialized because io.ReadSeeker has a shared cursor.
-func NewReadSeekerSource(src io.ReadSeeker) Source {
-	return &readSeekerSource{src: src}
-}
-
-func (s *readSeekerSource) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
-	if start < 0 {
-		return nil, fmt.Errorf("varc: negative range start %d", start)
-	}
-	s.mu.Lock()
-	if _, err := s.src.Seek(start, io.SeekStart); err != nil {
-		s.mu.Unlock()
-		return nil, err
-	}
-	var reader io.Reader = s.src
-	if end >= start {
-		reader = io.LimitReader(s.src, end-start+1)
-	}
-	return &lockedReadCloser{reader: reader, unlock: s.mu.Unlock}, nil
-}
-
-type lockedReadCloser struct {
-	reader io.Reader
-	once   sync.Once
-	unlock func()
-}
-
-func (r *lockedReadCloser) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	if err != nil {
-		r.Close()
-	}
-	return n, err
-}
-
-func (r *lockedReadCloser) Close() error {
-	r.once.Do(r.unlock)
 	return nil
 }
 
-type readerAtSource struct {
-	src  io.ReaderAt
-	size int64
+// Stats returns simple cache statistics.
+func (c *Cache) Stats() map[string]interface{} {
+	var files int
+	var bytesUsed int64
+	_ = filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || strings.HasSuffix(path, ".meta") {
+			return nil
+		}
+		files++
+		if info, statErr := d.Info(); statErr == nil {
+			bytesUsed += info.Size()
+		}
+		return nil
+	})
+	return map[string]interface{}{"files": files, "bytesUsed": bytesUsed}
 }
 
-// NewReaderAtSource adapts any io.ReaderAt into a Source.
-func NewReaderAtSource(src io.ReaderAt, size int64) Source {
-	return readerAtSource{src: src, size: size}
+// Close shuts down the cache. The simple ReaderAt cache has no background work.
+func (c *Cache) Close() error { return nil }
+
+func (r *Reader) Read(p []byte) (int, error) {
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if r.closed {
+		return 0, os.ErrClosed
+	}
+	n, err := r.readAt(p, r.pos)
+	r.pos += int64(n)
+	return n, err
 }
 
-func (s readerAtSource) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
-	if start < 0 {
-		return nil, fmt.Errorf("varc: negative range start %d", start)
+func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if r.closed {
+		return 0, os.ErrClosed
 	}
-	if start > s.size {
-		start = s.size
-	}
-	if end < 0 || end >= s.size {
-		end = s.size - 1
-	}
-	if end < start {
-		return io.NopCloser(strings.NewReader("")), nil
-	}
-	return io.NopCloser(io.NewSectionReader(s.src, start, end-start+1)), nil
+	return r.readAt(p, off)
 }
 
-func applyObjectOptions(obj *Object, opts []ObjectOption) {
-	for _, opt := range opts {
-		if opt != nil {
-			opt(obj)
+func (r *Reader) readAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if off < 0 {
+		return 0, fmt.Errorf("varc: negative offset %d", off)
+	}
+	if off >= r.meta.Size {
+		return 0, io.EOF
+	}
+	end := off + int64(len(p))
+	err := error(nil)
+	if end > r.meta.Size {
+		end = r.meta.Size
+		err = io.EOF
+	}
+	if fillErr := r.ensureRange(off, end); fillErr != nil {
+		return 0, fillErr
+	}
+	f, openErr := os.Open(r.path)
+	if openErr != nil {
+		return 0, openErr
+	}
+	defer f.Close()
+	n, readErr := f.ReadAt(p[:end-off], off)
+	if readErr != nil && readErr != io.EOF {
+		return n, readErr
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, readErr
+}
+
+func (r *Reader) Seek(offset int64, whence int) (int64, error) {
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if r.closed {
+		return 0, os.ErrClosed
+	}
+	var next int64
+	switch whence {
+	case io.SeekStart:
+		next = offset
+	case io.SeekCurrent:
+		next = r.pos + offset
+	case io.SeekEnd:
+		next = r.meta.Size + offset
+	default:
+		return r.pos, fmt.Errorf("varc: invalid whence %d", whence)
+	}
+	if next < 0 {
+		return r.pos, fmt.Errorf("varc: negative seek position %d", next)
+	}
+	r.pos = next
+	return r.pos, nil
+}
+
+func (r *Reader) Close() error {
+	r.readMu.Lock()
+	r.closed = true
+	r.readMu.Unlock()
+	r.cache.cancelReaderDownloaders(r)
+	return nil
+}
+
+func (r *Reader) Size() int64 { return r.meta.Size }
+
+func (r *Reader) ModTime() time.Time { return r.meta.ModTime }
+
+func (r *Reader) ensureRange(start, end int64) error {
+	r.cache.mu.Lock()
+	defer r.cache.mu.Unlock()
+
+	for {
+		if meta, ok, err := loadMeta(r.path + ".meta"); err != nil {
+			return err
+		} else if ok {
+			r.meta = meta
+		}
+		if !fileExists(r.path) {
+			r.meta.Ranges = nil
+		}
+		if containsRange(r.meta.Ranges, start, end) {
+			return nil
+		}
+		missingStart, missingEnd, ok := firstMissingRange(r.meta.Ranges, start, end)
+		if !ok {
+			return nil
+		}
+		if r.src == nil {
+			return fmt.Errorf("varc: cache miss for %q at %d-%d", r.key, missingStart, missingEnd-1)
+		}
+		r.cache.ensureDownloaderLocked(r, missingStart, missingEnd)
+		r.cache.cond.Wait()
+	}
+}
+
+func (c *Cache) ensureDownloaderLocked(owner *Reader, start, end int64) {
+	c.pruneDownloadersLocked(owner.path)
+	for _, d := range c.downloaders[owner.path] {
+		if !d.done && !d.cancel && d.start <= start && d.end >= end {
+			return
 		}
 	}
+	chunkStart := start - start%c.blockSize
+	chunkEnd := chunkStart + c.chunkSize
+	if chunkEnd > owner.meta.Size {
+		chunkEnd = owner.meta.Size
+	}
+	d := &downloader{
+		owner:  owner,
+		path:   owner.path,
+		src:    owner.src,
+		start:  chunkStart,
+		end:    chunkEnd,
+		offset: chunkStart,
+		doneCh: make(chan struct{}),
+	}
+	c.downloaders[owner.path] = append(c.downloaders[owner.path], d)
+	go c.runDownloader(d)
 }
 
-func parseRangeHeader(value string) (start, end int64, err error) {
-	if !strings.HasPrefix(value, "bytes=") {
-		return 0, -1, fmt.Errorf("varc: unsupported range header %q", value)
+func (c *Cache) runDownloader(d *downloader) {
+	defer func() {
+		c.mu.Lock()
+		d.done = true
+		close(d.doneCh)
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}()
+
+	for {
+		c.mu.Lock()
+		if d.cancel || d.offset >= d.end {
+			c.mu.Unlock()
+			return
+		}
+		start := d.offset
+		end := start + c.blockSize
+		if end > d.end {
+			end = d.end
+		}
+		c.mu.Unlock()
+
+		buf := make([]byte, end-start)
+		n, err := d.src.ReadAt(buf, start)
+		if err != nil && err != io.EOF {
+			c.finishDownloader(d, err)
+			return
+		}
+		if n != len(buf) {
+			c.finishDownloader(d, io.ErrUnexpectedEOF)
+			return
+		}
+
+		c.mu.Lock()
+		if d.cancel {
+			c.mu.Unlock()
+			return
+		}
+		if err := writeCacheBlock(d.path, buf, start, d.owner.meta.ModTime); err != nil {
+			d.err = err
+			d.cancel = true
+			c.cond.Broadcast()
+			c.mu.Unlock()
+			return
+		}
+		meta, ok, err := loadMetaLocked(d.path + ".meta")
+		if err != nil {
+			d.err = err
+			d.cancel = true
+			c.cond.Broadcast()
+			c.mu.Unlock()
+			return
+		}
+		if !ok {
+			meta = d.owner.meta
+		}
+		meta.Ranges = addRange(meta.Ranges, start, end)
+		if err := saveMetaLocked(d.path+".meta", meta); err != nil {
+			d.err = err
+			d.cancel = true
+			c.cond.Broadcast()
+			c.mu.Unlock()
+			return
+		}
+		d.owner.meta = meta
+		d.offset = end
+		c.cond.Broadcast()
+		c.mu.Unlock()
 	}
-	rangeValue := strings.TrimPrefix(value, "bytes=")
-	if strings.HasSuffix(rangeValue, "-") {
-		_, err = fmt.Sscanf(rangeValue, "%d-", &start)
-		return start, -1, err
-	}
-	_, err = fmt.Sscanf(rangeValue, "%d-%d", &start, &end)
-	return start, end, err
 }
 
-func (r *cacheReader) Read(p []byte) (int, error)              { return r.handle.Read(p) }
-func (r *cacheReader) ReadAt(p []byte, off int64) (int, error) { return r.handle.ReadAt(p, off) }
-func (r *cacheReader) Seek(offset int64, whence int) (int64, error) {
-	return r.handle.Seek(offset, whence)
-}
-func (r *cacheReader) Close() error { return r.handle.Close() }
-func (r *cacheReader) Size() int64 {
-	if r.sizer == nil {
-		return -1
-	}
-	return r.sizer.Size()
+func (c *Cache) finishDownloader(d *downloader, err error) {
+	c.mu.Lock()
+	d.err = err
+	d.cancel = true
+	c.cond.Broadcast()
+	c.mu.Unlock()
 }
 
-func (r *cacheReader) ModTime() time.Time {
-	info, err := r.handle.Stat()
+func (c *Cache) pruneDownloadersLocked(path string) {
+	dls := c.downloaders[path]
+	kept := dls[:0]
+	for _, d := range dls {
+		if !d.done {
+			kept = append(kept, d)
+		}
+	}
+	if len(kept) == 0 {
+		delete(c.downloaders, path)
+		return
+	}
+	c.downloaders[path] = kept
+}
+
+func (c *Cache) cancelDownloadersLocked(path string) {
+	for _, d := range c.downloaders[path] {
+		d.cancel = true
+	}
+	c.cond.Broadcast()
+}
+
+func (c *Cache) cancelReaderDownloaders(owner *Reader) {
+	c.mu.Lock()
+	var done []chan struct{}
+	for _, d := range c.downloaders[owner.path] {
+		if d.owner == owner && !d.done {
+			d.cancel = true
+			done = append(done, d.doneCh)
+		}
+	}
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	for _, ch := range done {
+		<-ch
+	}
+}
+
+func writeCacheBlock(path string, buf []byte, off int64, modTime time.Time) error {
+	f, openErr := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if openErr != nil {
+		return openErr
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(buf, off); err != nil {
+		return err
+	}
+	if !modTime.IsZero() {
+		_ = os.Chtimes(path, modTime, modTime)
+	}
+	return nil
+}
+
+func loadMeta(path string) (cacheMeta, bool, error) {
+	return loadMetaLocked(path)
+}
+
+func loadMetaLocked(path string) (cacheMeta, bool, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return time.Time{}
+		if os.IsNotExist(err) {
+			return cacheMeta{}, false, nil
+		}
+		return cacheMeta{}, true, err
 	}
-	return info.ModTime()
-}
-
-type remoteAdapter struct {
-	remote RemoteObject
-}
-
-func (a remoteAdapter) Open(ctx context.Context, options ...types.OpenOption) (io.ReadCloser, error) {
-	converted := make([]OpenOption, len(options))
-	for i, option := range options {
-		converted[i] = internalOpenOption{option: option}
+	var meta cacheMeta
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return cacheMeta{}, true, err
 	}
-	return a.remote.Open(ctx, converted...)
+	return meta, true, nil
 }
 
-func (a remoteAdapter) Size() int64    { return a.remote.Size() }
-func (a remoteAdapter) String() string { return a.remote.String() }
-
-type remoteAdapterFingerprint struct{ remoteAdapter }
-
-func (a remoteAdapterFingerprint) Fingerprint() string {
-	return a.remote.(Fingerprinter).Fingerprint()
+func saveMeta(path string, meta cacheMeta) error {
+	return saveMetaLocked(path, meta)
 }
 
-type remoteAdapterModTime struct{ remoteAdapter }
-
-func (a remoteAdapterModTime) ModTime(ctx context.Context) time.Time {
-	return a.remote.(ModTimer).ModTime(ctx)
-}
-
-type remoteAdapterFingerprintModTime struct{ remoteAdapter }
-
-func (a remoteAdapterFingerprintModTime) Fingerprint() string {
-	return a.remote.(Fingerprinter).Fingerprint()
-}
-
-func (a remoteAdapterFingerprintModTime) ModTime(ctx context.Context) time.Time {
-	return a.remote.(ModTimer).ModTime(ctx)
-}
-
-type internalOpenOption struct {
-	option types.OpenOption
-}
-
-func (o internalOpenOption) Header() (key, value string) {
-	return o.option.Header()
-}
-
-func adaptRemote(obj RemoteObject) types.RemoteObject {
-	if obj == nil {
-		return nil
+func saveMetaLocked(path string, meta cacheMeta) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
 	}
-	base := remoteAdapter{remote: obj}
-	_, hasFingerprint := obj.(Fingerprinter)
-	_, hasModTime := obj.(ModTimer)
-	switch {
-	case hasFingerprint && hasModTime:
-		return remoteAdapterFingerprintModTime{remoteAdapter: base}
-	case hasFingerprint:
-		return remoteAdapterFingerprint{remoteAdapter: base}
-	case hasModTime:
-		return remoteAdapterModTime{remoteAdapter: base}
-	default:
-		return base
+	b, err := json.MarshalIndent(meta, "", "\t")
+	if err != nil {
+		return err
 	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func containsRange(ranges []byteRange, start, end int64) bool {
+	for _, r := range ranges {
+		if r.Start <= start && r.End >= end {
+			return true
+		}
+	}
+	return false
+}
+
+func firstMissingRange(ranges []byteRange, start, end int64) (int64, int64, bool) {
+	pos := start
+	sorted := append([]byteRange(nil), ranges...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Start < sorted[j].Start })
+	for _, r := range sorted {
+		if r.End <= pos {
+			continue
+		}
+		if r.Start > pos {
+			return pos, min(r.Start, end), true
+		}
+		if r.End > pos {
+			pos = r.End
+		}
+		if pos >= end {
+			return 0, 0, false
+		}
+	}
+	if pos < end {
+		return pos, end, true
+	}
+	return 0, 0, false
+}
+
+func addRange(ranges []byteRange, start, end int64) []byteRange {
+	ranges = append(ranges, byteRange{Start: start, End: end})
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].Start < ranges[j].Start })
+	merged := ranges[:0]
+	for _, r := range ranges {
+		if len(merged) == 0 || r.Start > merged[len(merged)-1].End {
+			merged = append(merged, r)
+			continue
+		}
+		if r.End > merged[len(merged)-1].End {
+			merged[len(merged)-1].End = r.End
+		}
+	}
+	return merged
 }
 
 func mergeOptions(defaults, override Options) Options {
 	if override.CacheDir != "" {
 		defaults.CacheDir = override.CacheDir
+	}
+	if override.BlockSize != 0 {
+		defaults.BlockSize = override.BlockSize
 	}
 	if override.ChunkSize != 0 {
 		defaults.ChunkSize = override.ChunkSize
