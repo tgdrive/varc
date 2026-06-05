@@ -9,7 +9,6 @@ package varc
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,7 +36,7 @@ const (
 )
 
 func init() {
-	caddy.RegisterModule(Handler{})
+	caddy.RegisterModule(new(Handler))
 }
 
 // Handler is a Caddy HTTP middleware that turns a remote HTTP origin into a
@@ -79,6 +79,49 @@ type Handler struct {
 	// upstream URL and when the default key is based on that URL.
 	IgnoreQuery bool `json:"ignore_query,omitempty"`
 
+	// StripQuery removes named query parameters before building the upstream URL
+	// and default cache key.  It is intended for tracking parameters like utm_*.
+	StripQuery []string `json:"strip_query,omitempty"`
+
+	// SortQuery sorts query keys/values into a canonical order before building the
+	// upstream URL and default key, so ?b=2&a=1 and ?a=1&b=2 collapse.
+	SortQuery bool `json:"sort_query,omitempty"`
+
+	// LowercaseHost canonicalizes the upstream host used in the default key.
+	LowercaseHost bool `json:"lowercase_host,omitempty"`
+
+	// VaryHeaders adds selected request headers to the varc key.  Use this when a
+	// forwarded header changes object bytes, for example Accept-Language or auth scope.
+	VaryHeaders []string `json:"vary_headers,omitempty"`
+
+	// BypassHeaders bypasses varc and streams from origin if any named header is
+	// present.  Authorization is bypassed by default unless CacheAuthorization is true.
+	BypassHeaders []string `json:"bypass_headers,omitempty"`
+
+	// BypassCookies bypasses varc if any named cookie is present.
+	BypassCookies []string `json:"bypass_cookies,omitempty"`
+
+	// BypassQuery bypasses varc if any named query parameter is present.
+	BypassQuery []string `json:"bypass_query,omitempty"`
+
+	// CacheAuthorization allows requests with Authorization to use the shared cache.
+	// Leave false unless the key includes the auth scope or the origin ignores auth.
+	CacheAuthorization bool `json:"cache_authorization,omitempty"`
+
+	// CacheSetCookie allows responses carrying Set-Cookie to be cached.  The default
+	// is to bypass those responses to avoid poisoning a shared cache.
+	CacheSetCookie bool `json:"cache_set_cookie,omitempty"`
+
+	// CachePrivate allows Cache-Control: private responses to be cached.
+	CachePrivate bool `json:"cache_private,omitempty"`
+
+	// CacheNoStore allows Cache-Control: no-store responses to be cached.
+	CacheNoStore bool `json:"cache_no_store,omitempty"`
+
+	// StaleIfError serves a cached copy for the requested range when the origin
+	// probe/open path fails.  This is range-scoped and does not refresh in background.
+	StaleIfError caddy.Duration `json:"stale_if_error,omitempty"`
+
 	// CacheOnly serves only already-cached complete/range data.  No upstream probe
 	// or fetch is performed on misses.
 	CacheOnly bool `json:"cache_only,omitempty"`
@@ -90,9 +133,16 @@ type Handler struct {
 	// DebugHeaders adds X-Varc-* response headers.
 	DebugHeaders bool `json:"debug_headers,omitempty"`
 
-	// AdminPath enables a small JSON status/prune endpoint on the same handler.
-	// Protect this path with your own auth/matchers if exposed publicly.
+	// AdminPath enables JSON operator endpoints on the same handler.  By default it
+	// is loopback-only unless AdminAllowRemote is true.  AdminToken adds bearer-token auth.
 	AdminPath string `json:"admin_path,omitempty"`
+
+	// AdminToken requires Authorization: Bearer <token> or X-Varc-Admin-Token.
+	AdminToken string `json:"admin_token,omitempty"`
+
+	// AdminAllowRemote allows non-loopback clients to reach AdminPath.  Prefer to
+	// keep this false and protect admin routes with Caddy matchers/auth.
+	AdminAllowRemote bool `json:"admin_allow_remote,omitempty"`
 
 	// Timeouts and transport tuning.
 	Timeout         caddy.Duration `json:"timeout,omitempty"`
@@ -129,10 +179,13 @@ type Handler struct {
 	logger *zap.Logger
 	cache  *varc.Cache
 	client *http.Client
+
+	metrics handlerMetrics
+	flights *flightGroup
 }
 
 // CaddyModule returns the Caddy module information.
-func (Handler) CaddyModule() caddy.ModuleInfo {
+func (*Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.varc",
 		New: func() caddy.Module { return new(Handler) },
@@ -142,6 +195,9 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision prepares the HTTP client and varc cache.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
+	if h.flights == nil {
+		h.flights = newFlightGroup()
+	}
 	if h.CacheDir == "" {
 		h.CacheDir = defaultCacheDir
 	}
@@ -252,10 +308,16 @@ func (h *Handler) Cleanup() error {
 
 // ServeHTTP serves GET/HEAD requests through varc.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if h.AdminPath != "" && r.URL.Path == h.AdminPath {
+	if h.isAdminRequest(r) {
 		return h.serveAdmin(w, r)
 	}
+	h.ensureRuntime()
+	start := time.Now()
+	h.metrics.requests.Add(1)
+	defer func() { h.metrics.observeDuration(time.Since(start)) }()
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		h.metrics.bypass.Add(1)
 		if h.PassThru {
 			return next.ServeHTTP(w, r)
 		}
@@ -269,12 +331,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	repl := replacerFromRequest(r)
 	sourceURL, err := h.resolveSourceURL(repl, r)
 	if err != nil {
+		h.metrics.errors.Add(1)
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
 	key := h.cacheKey(repl, r, sourceURL)
 
-	served, err := h.tryServeCache(w, r, key, sourceURL)
+	if reason := h.requestBypassReason(r); reason != "" {
+		h.metrics.bypass.Add(1)
+		return h.proxyBypass(w, r, sourceURL, key, reason)
+	}
+
+	served, err := h.tryServeCache(w, r, key, sourceURL, "HIT")
 	if err != nil {
+		h.metrics.errors.Add(1)
 		return err
 	}
 	if served {
@@ -282,24 +351,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	if h.CacheOnly {
 		if h.PassThru {
+			h.metrics.bypass.Add(1)
 			return next.ServeHTTP(w, r)
 		}
+		h.metrics.cacheOnlyMisses.Add(1)
 		return caddyhttp.Error(http.StatusNotFound, fmt.Errorf("varc: cache miss for %s", key))
 	}
 
-	remote, err := h.probeRemote(r.Context(), r, sourceURL)
+	remote, err := h.probeRemoteSingleflight(r.Context(), r, key, sourceURL)
 	if err != nil {
+		if h.canServeStale() {
+			served, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
+			if staleErr == nil && served {
+				return nil
+			}
+		}
 		if h.PassThru {
 			h.logger.Warn("varc upstream probe failed; passing through", zap.Error(err), zap.String("url", sourceURL))
+			h.metrics.bypass.Add(1)
 			return next.ServeHTTP(w, r)
 		}
+		h.metrics.errors.Add(1)
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
+	if reason := h.responseBypassReason(remote); reason != "" {
+		h.metrics.bypass.Add(1)
+		return h.proxyBypass(w, r, sourceURL, key, reason)
+	}
 	if remote.Size < 0 {
+		h.metrics.errors.Add(1)
 		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("varc: upstream did not provide a byte-addressable size"))
 	}
 	span, err := parseSingleRange(r.Header.Get("Range"), remote.Size)
 	if err != nil {
+		h.metrics.rangeNotSatisfiable.Add(1)
 		writeRangeNotSatisfiable(w, remote.Size)
 		return nil
 	}
@@ -327,19 +412,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		varc.WithAttr("content_type", remote.ContentType),
 		varc.WithAttr("etag", remote.ETag),
 		varc.WithAttr("last_modified", formatHTTPTime(remote.LastModified)),
+		varc.WithAttr("cache_control", remote.CacheControl),
 	}
 	if !remote.LastModified.IsZero() {
 		opts = append(opts, varc.WithModTime(remote.LastModified))
 	}
 	vr, err := h.cache.Open(r.Context(), key, remote.Size, src, opts...)
 	if err != nil {
+		if h.canServeStale() {
+			served, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
+			if staleErr == nil && served {
+				return nil
+			}
+		}
+		h.metrics.errors.Add(1)
 		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("varc open: %w", err))
 	}
 	defer vr.Close()
 	return h.serveReader(w, r, vr, span, remoteFromReader(vr, remote), "MISS", sourceURL, key)
 }
 
-func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sourceURL string) (bool, error) {
+func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sourceURL, cacheStatus string) (bool, error) {
 	vr, err := h.cache.Open(r.Context(), key, 0, nil, varc.WithCacheOnly())
 	if err != nil {
 		if errors.Is(err, varc.ErrCacheMiss) {
@@ -353,6 +446,7 @@ func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sou
 	remote := remoteFromReader(vr, RemoteObject{SourceURL: sourceURL})
 	span, err := parseSingleRange(r.Header.Get("Range"), vr.Size())
 	if err != nil {
+		h.metrics.rangeNotSatisfiable.Add(1)
 		writeRangeNotSatisfiable(w, vr.Size())
 		return true, nil
 	}
@@ -367,7 +461,7 @@ func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sou
 	if err != nil || !cached {
 		return false, nil
 	}
-	return true, h.serveReader(w, r, vr, span, remote, "HIT", sourceURL, key)
+	return true, h.serveReader(w, r, vr, span, remote, cacheStatus, sourceURL, key)
 }
 
 func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.Reader, span byteSpan, remote RemoteObject, cacheStatus, sourceURL, key string) error {
@@ -376,12 +470,24 @@ func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.R
 		w.Header().Set("X-Varc-Cache", cacheStatus)
 		w.Header().Set("X-Varc-Key", key)
 		w.Header().Set("X-Varc-Source", sourceURL)
+		w.Header().Set("X-Varc-Range", fmt.Sprintf("%d-%d", span.Start, span.End))
 	}
 	status := http.StatusOK
 	if span.Partial {
 		status = http.StatusPartialContent
 	}
 	w.WriteHeader(status)
+	h.metrics.bytesServed.Add(span.Length())
+	switch cacheStatus {
+	case "HIT":
+		h.metrics.hits.Add(1)
+		h.metrics.bytesFromCache.Add(span.Length())
+	case "STALE":
+		h.metrics.staleHits.Add(1)
+		h.metrics.bytesFromCache.Add(span.Length())
+	default:
+		h.metrics.misses.Add(1)
+	}
 	if r.Method == http.MethodHead || span.Length() == 0 {
 		return nil
 	}
@@ -405,27 +511,82 @@ func (h *Handler) resolveSourceURL(repl *caddy.Replacer, r *http.Request) (strin
 	if u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("varc: upstream must resolve to absolute URL")
 	}
+	if h.LowercaseHost {
+		u.Host = strings.ToLower(u.Host)
+	}
 	if h.appendURI() {
 		u.Path = joinURLPath(u.Path, r.URL.EscapedPath())
 		if !h.IgnoreQuery {
-			u.RawQuery = r.URL.RawQuery
+			u.RawQuery = h.normalizeQuery(r.URL.RawQuery)
 		}
+	} else if !h.IgnoreQuery && (len(h.StripQuery) > 0 || h.SortQuery) {
+		u.RawQuery = h.normalizeQuery(u.RawQuery)
 	}
 	return u.String(), nil
 }
 
 func (h *Handler) cacheKey(repl *caddy.Replacer, r *http.Request, sourceURL string) string {
+	normalizedURI := r.URL.EscapedPath()
+	if !h.IgnoreQuery {
+		if q := h.normalizeQuery(r.URL.RawQuery); q != "" {
+			normalizedURI += "?" + q
+		}
+	}
 	if strings.TrimSpace(h.Key) == "" {
-		return sourceURL
+		key := sourceURL
+		if len(h.VaryHeaders) > 0 {
+			key += "|vary=" + h.varyKey(r)
+		}
+		return key
 	}
 	key := repl.ReplaceAll(h.Key, "")
 	key = strings.ReplaceAll(key, "{uri}", r.URL.RequestURI())
+	key = strings.ReplaceAll(key, "{normalized_uri}", normalizedURI)
+	key = strings.ReplaceAll(key, "{normalized_query}", h.normalizeQuery(r.URL.RawQuery))
 	key = strings.ReplaceAll(key, "{path}", r.URL.EscapedPath())
 	key = strings.ReplaceAll(key, "{host}", r.Host)
+	if len(h.VaryHeaders) > 0 {
+		key += "|vary=" + h.varyKey(r)
+	}
 	if key == "" {
 		return sourceURL
 	}
 	return key
+}
+
+func (h *Handler) normalizeQuery(raw string) string {
+	if raw == "" || h.IgnoreQuery {
+		return ""
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return raw
+	}
+	for _, name := range h.StripQuery {
+		delete(values, name)
+	}
+	if h.SortQuery || len(h.StripQuery) > 0 {
+		return values.Encode()
+	}
+	return raw
+}
+
+func (h *Handler) varyKey(r *http.Request) string {
+	if len(h.VaryHeaders) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(h.VaryHeaders))
+	for _, name := range h.VaryHeaders {
+		canonical := http.CanonicalHeaderKey(strings.TrimSpace(name))
+		if canonical == "" {
+			continue
+		}
+		vals := append([]string(nil), r.Header.Values(canonical)...)
+		sort.Strings(vals)
+		parts = append(parts, canonical+"="+strings.Join(vals, ","))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "&")
 }
 
 func (h *Handler) appendURI() bool {
@@ -451,33 +612,6 @@ func (h *Handler) originHeaders(r *http.Request) http.Header {
 	}
 	headers.Set("Accept-Encoding", "identity")
 	return headers
-}
-
-func (h *Handler) serveAdmin(w http.ResponseWriter, r *http.Request) error {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
-		return caddyhttp.Error(http.StatusMethodNotAllowed, fmt.Errorf("varc: admin method %s not supported", r.Method))
-	}
-	payload := map[string]any{
-		"cache_dir": h.cache.CacheDir(),
-		"metrics":   h.cache.Metrics(),
-		"time":      time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	if r.Method == http.MethodPost && r.URL.Query().Get("action") == "prune" {
-		stats, err := h.cache.Prune(r.Context())
-		payload["prune"] = stats
-		if err != nil {
-			payload["error"] = err.Error()
-		}
-	}
-	entries, err := h.cache.ListEntries(r.Context())
-	if err == nil {
-		payload["entries"] = len(entries)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(payload)
 }
 
 func setObjectHeaders(w http.ResponseWriter, remote RemoteObject, span byteSpan) {
@@ -529,6 +663,9 @@ func remoteFromReader(r *varc.Reader, fallback RemoteObject) RemoteObject {
 		if t, err := http.ParseTime(v); err == nil {
 			out.LastModified = t
 		}
+	}
+	if v, ok := r.Attr("cache_control"); ok && v != "" {
+		out.CacheControl = v
 	}
 	if out.LastModified.IsZero() {
 		out.LastModified = r.ModTime()

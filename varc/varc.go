@@ -424,6 +424,7 @@ type EntryInfo struct {
 	AccessedAt    time.Time
 	Ranges        []byteRange
 	Attrs         map[string]string
+	Pinned        bool
 	Complete      bool
 	OnDisk        bool
 	MetadataOK    bool
@@ -1663,6 +1664,7 @@ func (c *Cache) entryInfoFromMetaPath(metaPath string) EntryInfo {
 			info.Percent = 100
 		}
 		info.Attrs = cloneStringMap(meta.Attrs)
+		info.Pinned = isPinnedAttrs(meta.Attrs)
 		info.Complete = containsRange(info.Ranges, 0, meta.Size)
 	}
 	if st, err := os.Stat(dataPath); err == nil {
@@ -1720,7 +1722,7 @@ func (c *Cache) Prune(ctx context.Context) (PruneStats, error) {
 			c.removeEntryInfo(e, &stats)
 			continue
 		}
-		if e.OpenReaders > 0 || e.ActiveFetches > 0 {
+		if e.OpenReaders > 0 || e.ActiveFetches > 0 || e.Pinned {
 			survivors = append(survivors, e)
 			continue
 		}
@@ -1740,7 +1742,7 @@ func (c *Cache) Prune(ctx context.Context) (PruneStats, error) {
 				kept = append(kept, e)
 				continue
 			}
-			if e.OpenReaders > 0 || e.ActiveFetches > 0 {
+			if e.OpenReaders > 0 || e.ActiveFetches > 0 || e.Pinned {
 				kept = append(kept, e)
 				continue
 			}
@@ -1758,7 +1760,7 @@ func (c *Cache) Prune(ctx context.Context) (PruneStats, error) {
 				if free >= c.cacheMinFreeSpace {
 					break
 				}
-				if e.OpenReaders > 0 || e.ActiveFetches > 0 {
+				if e.OpenReaders > 0 || e.ActiveFetches > 0 || e.Pinned {
 					continue
 				}
 				stats.ReasonFree++

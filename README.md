@@ -50,10 +50,26 @@ Then run:
             cache_dir /var/cache/caddy/varc
             key {host}:{uri}
 
-            # Request URL behavior. With append_uri on, /media/a.mp4 is
+            # Request URL/key behavior. With append_uri on, /media/a.mp4 is
             # fetched from https://origin.example.com/media/a.mp4.
             append_uri on
             ignore_query off
+            strip_query utm_source utm_medium fbclid gclid
+            sort_query on
+            lowercase_host on
+            vary_header Accept-Language
+
+            # Safe shared-cache defaults. Authorization bypasses unless
+            # cache_authorization is explicitly enabled. Set-Cookie, private,
+            # and no-store responses bypass unless explicitly enabled.
+            bypass_header X-No-Cache
+            bypass_cookie session
+            bypass_query nocache
+            cache_authorization off
+            cache_set_cookie off
+            cache_private off
+            cache_no_store off
+            stale_if_error 1h
 
             # Cache tuning.
             block_size 1MiB
@@ -77,9 +93,11 @@ Then run:
             # header Authorization "Bearer {$ORIGIN_TOKEN}"
             # forward_header Authorization
 
-            # Debug/admin.
+            # Debug/admin. Admin is loopback-only by default; use a token if
+            # exposing it through authenticated Caddy routes.
             debug_headers on
             admin_path /_varc
+            # admin_token {$VARC_ADMIN_TOKEN}
         }
     }
 }
@@ -146,20 +164,29 @@ The module always sets:
 
 With `debug_headers on`, it also sets:
 
-- `X-Varc-Cache: HIT|MISS`
+- `X-Varc-Cache: HIT|MISS|STALE|BYPASS`
 - `X-Varc-Key`
 - `X-Varc-Source`
+- `X-Varc-Range`
+- `X-Varc-Bypass` for bypassed requests
 
 ## Admin endpoint
 
-If `admin_path /_varc` is configured:
+If `admin_path /_varc` is configured, the endpoint is loopback-only by default.
+Set `admin_token` to require `Authorization: Bearer <token>` or
+`X-Varc-Admin-Token`, and only use `admin_allow_remote on` behind Caddy auth/mTLS.
 
 ```bash
 curl http://localhost:8080/_varc
+curl http://localhost:8080/_varc/metrics
+curl 'http://localhost:8080/_varc/object?key=https://origin.example.com/media/a.mp4'
 curl -X POST 'http://localhost:8080/_varc?action=prune'
+curl -X POST 'http://localhost:8080/_varc?action=purge&key=https://origin.example.com/media/a.mp4'
+curl -X POST 'http://localhost:8080/_varc?action=pin&key=https://origin.example.com/media/a.mp4'
+curl -X POST 'http://localhost:8080/_varc?action=unpin&key=https://origin.example.com/media/a.mp4'
+curl -X POST 'http://localhost:8080/_varc?action=repair&dry_run=true'
+curl -X POST 'http://localhost:8080/_varc?action=warm&url=https://origin.example.com/media/a.mp4&range=0-8388607'
 ```
-
-Protect this route with Caddy matchers/auth if exposed outside localhost.
 
 ## Important production notes
 
@@ -167,7 +194,9 @@ Protect this route with Caddy matchers/auth if exposed outside localhost.
 - It forces `Accept-Encoding: identity` so cached byte offsets map to real upstream bytes.
 - Cached hits intentionally skip upstream validation. This is what avoids client initialization/network calls for already cached ranges. Use stable keys, ETags/fingerprints, TTL pruning, or versioned URLs to avoid serving stale content.
 - Multi-range responses are rejected with `416`. Most media players issue single ranges.
-- If your origin requires authorization, either add a static `header` or list request headers with `forward_header`. Include auth scope in `key` if different users may see different bytes for the same URL.
+- If your origin requires authorization, either add a static `header` or list request headers with `forward_header`. Requests with `Authorization` bypass by default. Only turn `cache_authorization on` when the cache key includes the auth scope or every authorized user receives identical bytes.
+- `Set-Cookie`, `Cache-Control: private`, and `Cache-Control: no-store` bypass by default to avoid shared-cache poisoning. Enable the corresponding `cache_*` options only for controlled origins.
+- Use `stale_if_error` to serve already-cached ranges when origin probing/opening fails.
 
 For Caddy adapter validation:
 
@@ -194,3 +223,56 @@ n, _ := r.ReadAt(buf, offset)
 ```
 
 See [API_USAGE.md](API_USAGE.md) for the full Go library reference: cache keys, fingerprints, readers, warming, metrics, pruning, HTTP range source adapter, error handling, and production tuning.
+
+## New production VFS controls
+
+This version includes extra operations meant for real VFS deployments and long-running cache nodes:
+
+- **Range planning**: `Cache.Plan` and `Reader.PlanRange` return cached/missing segments for a request without contacting the origin. Use this to decide whether to serve cache-only, pre-open a backend client, or return a fast miss.
+- **Pinned entries**: `Cache.Pin`, `Cache.Unpin`, and `Cache.IsPinned` protect hot/expensive objects from age, size, and free-space pruning while still allowing explicit `Remove`.
+- **Batch warming**: `Cache.WarmBatch` prefetches many files or selected byte ranges with bounded worker concurrency and context cancellation.
+- **Manifest export/import**: `ExportManifest` and `ImportManifest` snapshot/restore metadata sidecars for cache moves, disaster recovery, and pre-seeding.
+- **Repair/scrub**: `Repair` can remove orphan/corrupt metadata, drop invalid ranges/checksums, and normalize sidecars after crashes or manual file operations.
+- **Health snapshot**: `Health` reports writability, disk free space, pinned/complete/incomplete counts, open readers, active fetches, and inflight bytes.
+- **Operator-grade Caddy handler**: safe bypass defaults, normalized keys, stale-if-error serving, request probe coalescing, admin purge/pin/unpin/warm/repair/object endpoints, Prometheus text metrics, and heavier handler tests.
+
+Example range planning before opening a remote client:
+
+```go
+plan, err := cache.Plan(ctx, key, start, end, varc.WithFingerprint(etag))
+if err == nil && !plan.NeedFetch() {
+    // Safe cache-only path: no backend client required.
+    r, _ := cache.Open(ctx, key, -1, nil)
+    defer r.Close()
+    _, _ = r.ReadAt(buf, start)
+}
+```
+
+Example warm and pin flow:
+
+```go
+_, _ = cache.WarmBatch(ctx, []varc.WarmJob{{
+    Key: key,
+    Size: size,
+    Source: src,
+    Ranges: []varc.Range{{Start: 0, End: 4 << 20}},
+    OpenOptions: []varc.OpenOption{varc.WithFingerprint(etag)},
+}}, varc.WarmOptions{Concurrency: 4, Class: "startup"})
+
+_ = cache.Pin(ctx, key)   // protect from Prune
+_ = cache.Unpin(ctx, key) // allow normal eviction again
+```
+
+Operational maintenance:
+
+```go
+health := cache.Health(ctx)
+_ = cache.ExportManifest(ctx, manifestWriter)
+_, _ = cache.Repair(ctx, varc.RepairOptions{
+    RemoveCorruptMeta: true,
+    RemoveMissingData: true,
+    DropBadRanges:     true,
+    DropBadChecksums:  true,
+    TouchRepaired:     true,
+})
+```

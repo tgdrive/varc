@@ -5,6 +5,19 @@
             key {host}:{uri}
             append_uri on
             ignore_query off
+            strip_query utm_source utm_medium fbclid gclid
+            sort_query on
+            lowercase_host on
+            vary_header Accept-Language
+
+            bypass_header X-No-Cache
+            bypass_cookie session
+            bypass_query nocache
+            cache_authorization off
+            cache_set_cookie off
+            cache_private off
+            cache_no_store off
+            stale_if_error 1h
 
             block_size 1MiB
             chunk_size 128MiB
@@ -24,6 +37,7 @@
 
             debug_headers on
             admin_path /_varc
+            # admin_token {$VARC_ADMIN_TOKEN}
         }
     }
 }

@@ -32,10 +32,24 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    key {host}{uri}
 //	    append_uri on|off
 //	    ignore_query on|off
+//	    strip_query utm_source utm_medium fbclid
+//	    sort_query on|off
+//	    lowercase_host on|off
+//	    vary_header Accept-Language
+//	    bypass_header X-No-Cache
+//	    bypass_cookie session
+//	    bypass_query nocache
+//	    cache_authorization on|off
+//	    cache_set_cookie on|off
+//	    cache_private on|off
+//	    cache_no_store on|off
+//	    stale_if_error 1h
 //	    cache_only on|off
 //	    pass_thru on|off
 //	    debug_headers on|off
 //	    admin_path /_varc
+//	    admin_token {$VARC_ADMIN_TOKEN}
+//	    admin_allow_remote off
 //	    header Authorization "Bearer {$TOKEN}"
 //	    forward_header Authorization
 //	    block_size 1MiB
@@ -86,6 +100,86 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.IgnoreQuery = v
+			case "strip_query":
+				vals := d.RemainingArgs()
+				if len(vals) == 0 {
+					return d.ArgErr()
+				}
+				h.StripQuery = append(h.StripQuery, vals...)
+			case "sort_query":
+				v, err := nextBool(d)
+				if err != nil {
+					return err
+				}
+				h.SortQuery = v
+			case "lowercase_host":
+				v, err := nextBool(d)
+				if err != nil {
+					return err
+				}
+				h.LowercaseHost = v
+			case "vary_header":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.VaryHeaders = append(h.VaryHeaders, d.Val())
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			case "bypass_header":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.BypassHeaders = append(h.BypassHeaders, d.Val())
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			case "bypass_cookie":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.BypassCookies = append(h.BypassCookies, d.Val())
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			case "bypass_query":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.BypassQuery = append(h.BypassQuery, d.Val())
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			case "cache_authorization":
+				v, err := nextBool(d)
+				if err != nil {
+					return err
+				}
+				h.CacheAuthorization = v
+			case "cache_set_cookie":
+				v, err := nextBool(d)
+				if err != nil {
+					return err
+				}
+				h.CacheSetCookie = v
+			case "cache_private":
+				v, err := nextBool(d)
+				if err != nil {
+					return err
+				}
+				h.CachePrivate = v
+			case "cache_no_store":
+				v, err := nextBool(d)
+				if err != nil {
+					return err
+				}
+				h.CacheNoStore = v
+			case "stale_if_error":
+				dur, err := nextDuration(d)
+				if err != nil {
+					return err
+				}
+				h.StaleIfError = caddy.Duration(dur)
 			case "cache_only":
 				v, err := nextBool(d)
 				if err != nil {
@@ -127,6 +221,17 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.AdminPath = d.Val()
+			case "admin_token":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.AdminToken = d.Val()
+			case "admin_allow_remote":
+				v, err := nextBool(d)
+				if err != nil {
+					return err
+				}
+				h.AdminAllowRemote = v
 			case "header":
 				name, value, err := nextPair(d)
 				if err != nil {

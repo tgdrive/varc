@@ -695,3 +695,105 @@ Before deploying:
 - The cache assumes immutable content for a given fingerprint.
 - It is a range cache, not a general mutable filesystem.
 - Checksum verification validates local cached blocks, not remote authenticity unless your source/fingerprint also guarantees authenticity.
+
+## Production VFS operations added
+
+### Range planning without upstream access
+
+Use `Cache.Plan` before constructing an expensive backend client. It returns cached segments, missing segments, local coverage, and pin/completion state. This is the safest path when a VFS layer wants to avoid initializing a remote client if the requested range is already local.
+
+```go
+plan, err := cache.Plan(ctx, key, start, end, varc.WithFingerprint(etag))
+if err == nil && !plan.NeedFetch() {
+    r, err := cache.Open(ctx, key, -1, nil)
+    // serve from local cache only
+    _ = r
+    _ = err
+}
+```
+
+`Reader.PlanRange` provides the same planning from an already-open reader. Both APIs are metadata/data-file checks only; they never call `ReadAt` on the source.
+
+### Pinning hot objects
+
+`Cache.Pin(ctx, key)` stores a persistent metadata marker. `Prune` skips pinned entries for age, size, and free-space eviction. `Cache.Remove(key)` remains explicit and still deletes pinned entries.
+
+```go
+_ = cache.Pin(ctx, key)
+pinned, _ := cache.IsPinned(key)
+_ = pinned
+_ = cache.Unpin(ctx, key)
+```
+
+### Batch warming
+
+`WarmBatch` warms multiple objects with bounded concurrency. Each job uses the normal `Open` path, so fingerprint invalidation, retries, coalescing, block commits, and checksum metadata all remain consistent.
+
+```go
+results, err := cache.WarmBatch(ctx, []varc.WarmJob{{
+    Key: key,
+    Size: size,
+    Source: src,
+    Ranges: []varc.Range{{Start: 0, End: 4 << 20}},
+    OpenOptions: []varc.OpenOption{varc.WithFingerprint(etag)},
+}}, varc.WarmOptions{Concurrency: 4, Class: "startup", StopOnError: true})
+_ = results
+_ = err
+```
+
+### Manifest export/import
+
+`ExportManifest` writes a compact JSON snapshot of metadata sidecars. `ImportManifest` restores them. This is useful for cache moves, pre-seeding, or recovery after accidental metadata deletion. It does not copy data bytes.
+
+```go
+_ = cache.ExportManifest(ctx, w)
+stats, err := cache.ImportManifest(ctx, r, varc.ImportOptions{
+    Overwrite:        false,
+    RequireDataFiles: false,
+    MarkImported:     true,
+})
+_ = stats
+_ = err
+```
+
+### Repair and health
+
+`Health` is a cheap admin snapshot. `Repair` scans sidecars and data files, optionally removing corrupt/missing metadata and normalizing damaged range/checksum records.
+
+```go
+health := cache.Health(ctx)
+_ = health
+
+stats, err := cache.Repair(ctx, varc.RepairOptions{
+    RemoveCorruptMeta: true,
+    RemoveMissingData: true,
+    DropBadRanges:     true,
+    DropBadChecksums:  true,
+    TouchRepaired:     true,
+})
+_ = stats
+_ = err
+```
+
+
+## Caddy handler hardening controls
+
+The Caddy handler now includes production-facing controls around the core range cache:
+
+- `strip_query`, `sort_query`, and `lowercase_host` canonicalize upstream URLs/default keys.
+- `vary_header` appends selected request header values to the cache key.
+- `bypass_header`, `bypass_cookie`, and `bypass_query` stream from origin without caching.
+- `Authorization` bypasses by default. Enable `cache_authorization on` only when the key includes the authorization scope or the bytes are identical for every user.
+- `Set-Cookie`, `Cache-Control: private`, and `Cache-Control: no-store` bypass by default. Enable `cache_set_cookie`, `cache_private`, or `cache_no_store` only for trusted origins.
+- `stale_if_error` serves an already-cached requested range when origin probing/opening fails.
+- The admin endpoint supports status, Prometheus metrics, object plans, prune, purge, pin, unpin, repair, and warm.
+
+Admin examples:
+
+```bash
+curl http://localhost:8080/_varc
+curl http://localhost:8080/_varc/metrics
+curl 'http://localhost:8080/_varc/object?key=https://origin.example.com/video.mp4'
+curl -X POST 'http://localhost:8080/_varc?action=purge&key=https://origin.example.com/video.mp4'
+curl -X POST 'http://localhost:8080/_varc?action=warm&url=https://origin.example.com/video.mp4&range=0-8388607'
+```

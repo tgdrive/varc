@@ -21,6 +21,8 @@ type RemoteObject struct {
 	ETag         string
 	LastModified time.Time
 	AcceptRanges bool
+	CacheControl string
+	SetCookie    bool
 }
 
 // Fingerprint returns the varc content fingerprint used to invalidate stale
@@ -193,6 +195,8 @@ func remoteFromHeaders(h http.Header, size int64) RemoteObject {
 		ETag:         normalizeETag(etag),
 		LastModified: lastMod,
 		AcceptRanges: strings.Contains(strings.ToLower(h.Get("Accept-Ranges")), "bytes"),
+		CacheControl: strings.TrimSpace(h.Get("Cache-Control")),
+		SetCookie:    len(h.Values("Set-Cookie")) > 0,
 	}
 }
 
