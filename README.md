@@ -1,6 +1,6 @@
 # varc
 
-`varc` is a Caddy v2 HTTP handler module for serving remote HTTP objects through the `varc` sparse read-through VFS cache.
+`varc` is a Caddy v2 HTTP handler module for serving remote HTTP objects through the `varc` sparse read-through range cache.
 
 The important behavior is **cache-first range serving**:
 
@@ -206,7 +206,7 @@ For Caddy adapter validation:
 
 ## Go library
 
-The `varc` package is a standalone sparse read-through range cache for Go programs — media servers, object-storage gateways, FUSE/VFS layers, or any workload that reads byte ranges from a slower `io.ReaderAt` source.
+The `varc` package is a standalone sparse read-through range cache for Go programs — media servers, object-storage gateways, or any workload that reads byte ranges from a slower `io.ReaderAt` source.
 
 Minimal usage:
 
@@ -224,9 +224,9 @@ n, _ := r.ReadAt(buf, offset)
 
 See [API_USAGE.md](API_USAGE.md) for the full Go library reference: cache keys, fingerprints, readers, warming, metrics, pruning, HTTP range source adapter, error handling, and production tuning.
 
-## New production VFS controls
+## Operational controls
 
-This version includes extra operations meant for real VFS deployments and long-running cache nodes:
+The cache includes additional operations for long-running deployments:
 
 - **Range planning**: `Cache.Plan` and `Reader.PlanRange` return cached/missing segments for a request without contacting the origin. Use this to decide whether to serve cache-only, pre-open a backend client, or return a fast miss.
 - **Pinned entries**: `Cache.Pin`, `Cache.Unpin`, and `Cache.IsPinned` protect hot/expensive objects from age, size, and free-space pruning while still allowing explicit `Remove`.
@@ -236,43 +236,4 @@ This version includes extra operations meant for real VFS deployments and long-r
 - **Health snapshot**: `Health` reports writability, disk free space, pinned/complete/incomplete counts, open readers, active fetches, and inflight bytes.
 - **Operator-grade Caddy handler**: safe bypass defaults, normalized keys, stale-if-error serving, request probe coalescing, admin purge/pin/unpin/warm/repair/object endpoints, Prometheus text metrics, and heavier handler tests.
 
-Example range planning before opening a remote client:
-
-```go
-plan, err := cache.Plan(ctx, key, start, end, varc.WithFingerprint(etag))
-if err == nil && !plan.NeedFetch() {
-    // Safe cache-only path: no backend client required.
-    r, _ := cache.Open(ctx, key, -1, nil)
-    defer r.Close()
-    _, _ = r.ReadAt(buf, start)
-}
-```
-
-Example warm and pin flow:
-
-```go
-_, _ = cache.WarmBatch(ctx, []varc.WarmJob{{
-    Key: key,
-    Size: size,
-    Source: src,
-    Ranges: []varc.Range{{Start: 0, End: 4 << 20}},
-    OpenOptions: []varc.OpenOption{varc.WithFingerprint(etag)},
-}}, varc.WarmOptions{Concurrency: 4, Class: "startup"})
-
-_ = cache.Pin(ctx, key)   // protect from Prune
-_ = cache.Unpin(ctx, key) // allow normal eviction again
-```
-
-Operational maintenance:
-
-```go
-health := cache.Health(ctx)
-_ = cache.ExportManifest(ctx, manifestWriter)
-_, _ = cache.Repair(ctx, varc.RepairOptions{
-    RemoveCorruptMeta: true,
-    RemoveMissingData: true,
-    DropBadRanges:     true,
-    DropBadChecksums:  true,
-    TouchRepaired:     true,
-})
-```
+See [API_USAGE.md](API_USAGE.md) for usage examples.

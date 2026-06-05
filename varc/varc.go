@@ -1,12 +1,13 @@
-// Package varc implements a production-oriented read-through VFS cache for
+// Package varc implements a production-oriented read-through range cache for
 // immutable or content-addressable byte streams.
 //
-// The cache is designed for media/range workloads, virtual filesystems, HTTP
-// range servers, object-storage gateways, and rclone-style VFS adapters.  A
-// caller opens a key with a known size and an io.ReaderAt source.  varc stores
-// fetched byte ranges in a sparse local file and persists a compact metadata
-// sidecar describing which ranges are present.  Repeated reads are served from
-// disk and cache misses are filled from the source.
+// The cache is designed for media/range workloads, HTTP range servers,
+// object-storage gateways, and any consumer that reads byte ranges from a
+// slower io.ReaderAt source.  A caller opens a key with a known size and an
+// upstream reader; varc stores fetched byte ranges in a sparse local file and
+// persists a compact metadata sidecar describing which ranges are present.
+// Repeated reads are served from disk and cache misses are filled from the
+// source.
 //
 // The implementation emphasizes operational safety:
 //   - persistent sparse range metadata
@@ -138,8 +139,8 @@ func WithStrictFingerprint() OpenOption {
 }
 
 // WithAttr stores a string attribute in metadata.  Attributes are not used by
-// the cache core, but they are helpful for VFS layers that want to persist MIME
-// type, backend id, inode hint, remote path, or opaque generation numbers.
+// the cache core, but they are helpful for consumers that want to persist MIME
+// type, backend id, remote path, or opaque generation numbers on disk.
 func WithAttr(key, value string) OpenOption {
 	return func(o *openOptions) {
 		if key == "" {
@@ -202,12 +203,12 @@ type Options struct {
 	ReadAhead int64
 
 	// FastFingerprint is retained for compatibility with older configs.  The core
-	// cache does not compute full-file fingerprints by default because VFS sources
-	// are often remote and expensive.
+	// cache does not compute full-file fingerprints by default because upstream
+	// sources are often remote and expensive.
 	FastFingerprint bool
 
 	// HandleCaching is retained for compatibility.  It does not affect cache
-	// correctness.  VFS adapters can use it to decide how long to keep Reader
+	// correctness.  Consumers can use it to decide how long to keep Reader
 	// handles open.
 	HandleCaching time.Duration
 
@@ -253,7 +254,7 @@ type Options struct {
 	TouchInterval time.Duration
 }
 
-// DefaultOptions returns production-safe defaults for a read-through VFS cache.
+// DefaultOptions returns production-safe defaults for a read-through range cache.
 func DefaultOptions() Options {
 	return Options{
 		CacheDir:          filepath.Join(os.TempDir(), "varc_cache"),
@@ -277,7 +278,7 @@ func DefaultOptions() Options {
 	}
 }
 
-// Cache is a sparse, read-through, range-addressed VFS cache.
+// Cache is a sparse, read-through, range-addressed cache.
 type Cache struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -2350,7 +2351,7 @@ func (c *Cache) MetaPath(key string) string { return c.KeyPath(key) + ".meta" }
 
 // RangeCached reports whether the exact byte range [start, end) is already
 // present in the local cache for key. It never opens or touches the upstream
-// source, so VFS/HTTP layers can use it as a cheap preflight before creating a
+// source, so HTTP handlers can use it as a cheap preflight before creating a
 // remote client.
 //
 // The end offset is exclusive. For an HTTP range bytes=10-19, call
@@ -2404,7 +2405,7 @@ func (c *Cache) Coverage(key string) (cached int64, size int64, complete bool, e
 }
 
 // RenameKey moves cached data from oldKey to newKey when newKey does not exist.
-// It is intended for VFS layers that discover a better stable key after opening
+// It is intended for consumers that discover a better stable key after opening
 // by a temporary path.  Active readers are not moved.
 func (c *Cache) RenameKey(oldKey, newKey string) error {
 	if oldKey == "" || newKey == "" {

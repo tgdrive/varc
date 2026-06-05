@@ -1,8 +1,8 @@
-# varc — Read-through VFS range cache for Go
+# varc — Read-through range cache for Go
 
 > **Looking for the Caddy HTTP handler module?** See [README.md](README.md) for Caddyfile config, build instructions, and deployment.
 
-`varc` is a production-oriented read-through cache for immutable byte streams. It is designed for media servers, HTTP range handlers, object-storage gateways, rclone-style VFS adapters, and any workload that repeatedly reads byte ranges from a slower `io.ReaderAt` source.
+`varc` is a production-oriented read-through cache for immutable byte streams. It is designed for media servers, HTTP range handlers, object-storage gateways, and any workload that repeatedly reads byte ranges from a slower `io.ReaderAt` source.
 
 The cache stores fetched byte ranges in a sparse local data file and writes a `.meta` sidecar that records which ranges are available. Later reads for the same key are served from disk; missing ranges are fetched from the source, persisted, and then returned to the caller.
 
@@ -17,7 +17,7 @@ The cache stores fetched byte ranges in a sparse local data file and writes a `.
 - Optional CRC32 block verification
 - Background and manual pruning
 - LRU/age/max-size/free-space cleanup
-- Metadata attributes for VFS layers
+- Metadata attributes for cache consumers
 - Metrics, cache inspection, verification, and coverage APIs
 - Context-aware `ReadAtContext`, `WarmRange`, `WarmAll`, and `CopyTo`
 - Safe atomic metadata writes
@@ -25,31 +25,13 @@ The cache stores fetched byte ranges in a sparse local data file and writes a `.
 
 ## Installation
 
-Place `varc_vfs.go` in your Go module under a package directory, for example:
-
-```text
-myapp/
-  go.mod
-  internal/varc/varc_vfs.go
-```
-
-Then import it using your module path:
-
-```go
-import "myapp/internal/varc"
-```
-
-For a public module layout, place it at:
-
-```text
-your-module/varc/varc_vfs.go
-```
-
-and import:
+The `varc` package lives under `github.com/tgdrive/varc/varc`. Import it directly:
 
 ```go
 import "github.com/tgdrive/varc/varc"
 ```
+
+To vendor it into your own project, copy the `varc/` directory and adjust the import path accordingly.
 
 ## Basic usage
 
@@ -381,7 +363,7 @@ fmt.Println("copied", written, "bytes")
 
 ## Metadata attributes
 
-Attributes are arbitrary strings stored in the `.meta` sidecar. They are useful for VFS layers that need to remember remote object metadata.
+Attributes are arbitrary strings stored in the `.meta` sidecar. They are useful for cache consumers that need to remember remote object metadata (content type, backend ID, remote path, etc.).
 
 ```go
 r, err := cache.Open(ctx, key, size, src,
@@ -549,7 +531,7 @@ if err := cache.RenameKey("tmp:path", "stable:path"); err != nil {
 }
 ```
 
-`RenameKey` is useful when a VFS first opens by temporary path and later discovers a stable content key. It does not move active readers.
+`RenameKey` is useful when a consumer first opens by temporary path and later discovers a stable content key. It does not move active readers.
 
 ## Recommended production options
 
@@ -626,9 +608,9 @@ Common errors:
 - `Close` cancels active downloads owned by that reader.
 - `Cache.Close` cancels background work and active cache operations.
 
-## VFS integration pattern
+## Caching integration pattern
 
-A VFS layer usually does this:
+A typical cache consumer does this:
 
 1. Map a remote path/inode to a stable `key`.
 2. Fetch object metadata from the backend: size, fingerprint, modtime, content type.
@@ -641,7 +623,7 @@ A VFS layer usually does this:
 Example:
 
 ```go
-func OpenVFSFile(ctx context.Context, cache *varc.Cache, obj RemoteObject) (*varc.Reader, error) {
+func OpenCachedFile(ctx context.Context, cache *varc.Cache, obj RemoteObject) (*varc.Reader, error) {
     src := obj.NewReaderAt()
 
     return cache.Open(ctx, obj.StableKey(), obj.Size(), src,
@@ -696,11 +678,11 @@ Before deploying:
 - It is a range cache, not a general mutable filesystem.
 - Checksum verification validates local cached blocks, not remote authenticity unless your source/fingerprint also guarantees authenticity.
 
-## Production VFS operations added
+## Production operations
 
 ### Range planning without upstream access
 
-Use `Cache.Plan` before constructing an expensive backend client. It returns cached segments, missing segments, local coverage, and pin/completion state. This is the safest path when a VFS layer wants to avoid initializing a remote client if the requested range is already local.
+Use `Cache.Plan` before constructing an expensive backend client. It returns cached segments, missing segments, local coverage, and pin/completion state. This is the safest path when you want to avoid initializing a remote client if the requested range is already local.
 
 ```go
 plan, err := cache.Plan(ctx, key, start, end, varc.WithFingerprint(etag))
