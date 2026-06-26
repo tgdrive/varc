@@ -359,10 +359,10 @@ type entryState struct {
 
 	meta      cacheMeta
 	loaded    bool
-	loadErr   error
 	tasks     map[string]*downloadTask
 	lastError error
 	readers   int
+	refs      int
 	lastTouch time.Time
 	removed   bool
 }
@@ -647,9 +647,15 @@ func (c *Cache) Open(ctx context.Context, key string, size int64, src io.ReaderA
 		return nil, errors.New("varc: size must be known when source is provided")
 	}
 	path := filepath.Join(c.dir, ShardKey(key, c.shardLevel))
-	state := c.getState(path)
+	state := c.acquireState(path)
 	state.mu.Lock()
-	defer state.mu.Unlock()
+	keepState := false
+	defer func() {
+		state.mu.Unlock()
+		if !keepState {
+			c.releaseState(state)
+		}
+	}()
 
 	if err := os.MkdirAll(filepath.Dir(path), c.dirMode); err != nil {
 		c.metricOpenErrors.Add(1)
@@ -742,6 +748,7 @@ func (c *Cache) Open(ctx context.Context, key string, size int64, src io.ReaderA
 		cacheOnly: src == nil,
 	}
 	c.metricOpens.Add(1)
+	keepState = true
 	return r, nil
 }
 
@@ -761,21 +768,60 @@ func shouldInvalidate(meta cacheMeta, size int64, opt openOptions) bool {
 	return false
 }
 
-func (c *Cache) getState(path string) *entryState {
+func (c *Cache) acquireState(path string) *entryState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st := c.states[path]
-	if st != nil {
-		return st
+	if st == nil {
+		st = &entryState{
+			path:     path,
+			metaPath: path + ".meta",
+			tasks:    make(map[string]*downloadTask),
+		}
+		st.cond = sync.NewCond(&st.mu)
+		c.states[path] = st
 	}
-	st = &entryState{
-		path:     path,
-		metaPath: path + ".meta",
-		tasks:    make(map[string]*downloadTask),
-	}
-	st.cond = sync.NewCond(&st.mu)
-	c.states[path] = st
+	st.refs++
 	return st
+}
+
+func (c *Cache) releaseState(st *entryState) {
+	if st == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.states[st.path] != st {
+		return
+	}
+	if st.refs > 0 {
+		st.refs--
+	}
+	c.removeIdleStateLocked(st)
+}
+
+func (c *Cache) maybeForgetState(st *entryState) {
+	if st == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.states[st.path] != st {
+		return
+	}
+	c.removeIdleStateLocked(st)
+}
+
+func (c *Cache) removeIdleStateLocked(st *entryState) {
+	if st.refs != 0 {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	c.pruneTasksLocked(st)
+	if st.readers == 0 && activeTasks(st.tasks) == 0 {
+		delete(c.states, st.path)
+	}
 }
 
 func (c *Cache) forgetState(path string) {
@@ -784,18 +830,24 @@ func (c *Cache) forgetState(path string) {
 	c.mu.Unlock()
 }
 
+func (c *Cache) forgetStateIfMatch(st *entryState) {
+	c.mu.Lock()
+	if c.states[st.path] == st {
+		delete(c.states, st.path)
+	}
+	c.mu.Unlock()
+}
+
 func (c *Cache) loadStateLocked(st *entryState) error {
-	if st.loaded || st.loadErr != nil {
-		return st.loadErr
+	if st.loaded {
+		return nil
 	}
 	meta, ok, err := loadMeta(st.metaPath)
 	if err != nil {
-		st.loadErr = err
 		return err
 	}
 	if ok {
 		if err := validateMeta(meta); err != nil {
-			st.loadErr = err
 			return err
 		}
 		meta.Ranges = normalizeRanges(meta.Ranges, meta.Size)
@@ -827,7 +879,8 @@ func (c *Cache) Remove(key string) error {
 }
 
 func (c *Cache) removePath(path string) error {
-	st := c.getState(path)
+	st := c.acquireState(path)
+	defer c.releaseState(st)
 	st.mu.Lock()
 	c.cancelTasksLocked(st)
 	bytes := dataFileSize(path)
@@ -844,7 +897,7 @@ func (c *Cache) removePath(path string) error {
 	}
 	c.metricEvictions.Add(1)
 	c.metricEvictedBytes.Add(bytes)
-	c.forgetState(path)
+	c.forgetStateIfMatch(st)
 	return joinErrors(errs...)
 }
 
@@ -1103,6 +1156,7 @@ func (r *Reader) Close() error {
 	}
 	st.cond.Broadcast()
 	st.mu.Unlock()
+	r.cache.releaseState(st)
 	return nil
 }
 
@@ -1279,6 +1333,7 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end int
 
 func (c *Cache) runDownloadTask(t *downloadTask) {
 	defer c.wg.Done()
+	defer c.maybeForgetState(t.state)
 	if err := c.acquire(t.ctx); err != nil {
 		c.finishTask(t, err)
 		return
@@ -2505,7 +2560,8 @@ func (c *Cache) WaitComplete(ctx context.Context, key string) error {
 		ctx = context.Background()
 	}
 	path := c.KeyPath(key)
-	st := c.getState(path)
+	st := c.acquireState(path)
+	defer c.releaseState(st)
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	for {

@@ -271,7 +271,8 @@ func (c *Cache) updateAttrs(ctx context.Context, key string, fn func(map[string]
 		return err
 	}
 	path := c.KeyPath(key)
-	st := c.getState(path)
+	st := c.acquireState(path)
+	defer c.releaseState(st)
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if err := c.reloadMetaLocked(st); err != nil {

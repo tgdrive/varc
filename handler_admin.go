@@ -210,19 +210,7 @@ func (h *Handler) adminWarm(r *http.Request) (map[string]any, error) {
 	if start < 0 || start > end {
 		return nil, fmt.Errorf("varc: invalid warm range")
 	}
-	src := &HTTPRangeSource{Context: r.Context(), Client: h.client, URL: sourceURL, Headers: h.originHeaders(r), Logger: h.logger, ValidateSize: remote.Size}
-	opts := []varc.OpenOption{
-		varc.WithFingerprint(remote.Fingerprint()),
-		varc.WithStrictFingerprint(),
-		varc.WithAttr("source_url", sourceURL),
-		varc.WithAttr("content_type", remote.ContentType),
-		varc.WithAttr("etag", remote.ETag),
-		varc.WithAttr("last_modified", formatHTTPTime(remote.LastModified)),
-		varc.WithAttr("cache_control", remote.CacheControl),
-	}
-	if !remote.LastModified.IsZero() {
-		opts = append(opts, varc.WithModTime(remote.LastModified))
-	}
+	src, opts := h.cacheSourceAndOptions(r, sourceURL, remote)
 	job := varc.WarmJob{Key: key, Size: remote.Size, Source: src, OpenOptions: opts}
 	if end > start {
 		job.Ranges = []varc.Range{{Start: start, End: end}}

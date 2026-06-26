@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,126 @@ func (s *flakySource) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+func waitTrackedEntries(t *testing.T, c *Cache, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		got := c.Metrics().OpenTrackedEntries
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tracked entries = %d, want %d", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestEntryStateLifecycleAndMetadataRecovery(t *testing.T) {
+	c, _ := openTestCache(t)
+	src := newCountingSource(2048)
+	ctx := context.Background()
+
+	r, err := c.Open(ctx, "state-lifecycle", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := c.Metrics().OpenTrackedEntries; got != 1 {
+		t.Fatalf("tracked entries while open = %d, want 1", got)
+	}
+	buf := make([]byte, len(src.data))
+	if n, err := r.ReadAt(buf, 0); err != nil || n != len(buf) {
+		t.Fatalf("ReadAt n=%d err=%v", n, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitTrackedEntries(t, c, 0)
+
+	if _, err := c.Open(ctx, "missing-state", 0, nil, WithCacheOnly()); !errors.Is(err, ErrCacheMiss) {
+		t.Fatalf("cache-only miss err=%v", err)
+	}
+	if got := c.Metrics().OpenTrackedEntries; got != 0 {
+		t.Fatalf("failed open retained %d states", got)
+	}
+
+	metaPath := c.MetaPath("state-lifecycle")
+	validMeta, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read valid metadata: %v", err)
+	}
+	if err := os.WriteFile(metaPath, []byte("{"), 0o600); err != nil {
+		t.Fatalf("write corrupt metadata: %v", err)
+	}
+	st := c.acquireState(c.KeyPath("state-lifecycle"))
+	st.mu.Lock()
+	if err := c.loadStateLocked(st); err == nil {
+		st.mu.Unlock()
+		c.releaseState(st)
+		t.Fatal("expected corrupt metadata error")
+	}
+	if err := os.WriteFile(metaPath, validMeta, 0o600); err != nil {
+		st.mu.Unlock()
+		c.releaseState(st)
+		t.Fatalf("restore metadata: %v", err)
+	}
+	if err := c.loadStateLocked(st); err != nil {
+		st.mu.Unlock()
+		c.releaseState(st)
+		t.Fatalf("metadata load did not recover: %v", err)
+	}
+	st.mu.Unlock()
+	c.releaseState(st)
+}
+
+func TestEntryStateConcurrentAcquireRelease(t *testing.T) {
+	c, _ := openTestCache(t)
+	src := newCountingSource(1024)
+	ctx := context.Background()
+	r, err := c.Open(ctx, "state-concurrent", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	buf := make([]byte, len(src.data))
+	if n, err := r.ReadAt(buf, 0); err != nil || n != len(buf) {
+		t.Fatalf("ReadAt n=%d err=%v", n, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	const workers = 16
+	const iterations = 25
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < iterations; j++ {
+				r, err := c.Open(ctx, "state-concurrent", 0, nil, WithCacheOnly())
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if err := r.Close(); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Errorf("concurrent open/close: %v", err)
+	}
+	waitTrackedEntries(t, c, 0)
 }
 
 func TestOptionsValidationAccessorsStatsAndClosedPaths(t *testing.T) {

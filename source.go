@@ -87,11 +87,10 @@ func (s *HTTPRangeSource) ReadAt(p []byte, off int64) (int, error) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return 0, fmt.Errorf("upstream range fetch %s returned %d: %s", s.URL, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	if cr := resp.Header.Get("Content-Range"); cr != "" {
-		start, gotEnd, _, ok := parseContentRange(cr)
-		if !ok || start != off || gotEnd != end {
-			return 0, fmt.Errorf("upstream returned unexpected Content-Range %q for bytes=%d-%d", cr, off, end)
-		}
+	cr := resp.Header.Get("Content-Range")
+	start, gotEnd, total, ok := parseContentRange(cr)
+	if !ok || start != off || gotEnd != end || (s.ValidateSize >= 0 && total != s.ValidateSize) {
+		return 0, fmt.Errorf("upstream returned unexpected Content-Range %q for bytes=%d-%d size=%d", cr, off, end, s.ValidateSize)
 	}
 	n, readErr := io.ReadFull(resp.Body, p)
 	if readErr != nil {

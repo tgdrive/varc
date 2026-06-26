@@ -26,6 +26,22 @@ func TestResolveSourceURL(t *testing.T) {
 	}
 }
 
+func TestResolveSourceURLPreservesEscapedPath(t *testing.T) {
+	on := true
+	h := &Handler{Upstream: "https://origin.example.com/base%2Froot", AppendURI: &on}
+	r := httptest.NewRequest(http.MethodGet, "https://edge.example.com/video/a%2F%2Fb%20c", nil)
+	repl := replacerFromRequest(r)
+
+	got, err := h.resolveSourceURL(repl, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://origin.example.com/base%2Froot/video/a%2F%2Fb%20c"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 func TestCacheKeyDefaultAndTemplate(t *testing.T) {
 	h := &Handler{}
 	r := httptest.NewRequest(http.MethodGet, "https://edge.example.com/a?b=1", nil)

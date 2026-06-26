@@ -396,27 +396,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	src := &HTTPRangeSource{
-		Context:      r.Context(),
-		Client:       h.client,
-		URL:          sourceURL,
-		Headers:      h.originHeaders(r),
-		Logger:       h.logger,
-		ValidateSize: remote.Size,
-	}
-	fingerprint := remote.Fingerprint()
-	opts := []varc.OpenOption{
-		varc.WithFingerprint(fingerprint),
-		varc.WithStrictFingerprint(),
-		varc.WithAttr("source_url", sourceURL),
-		varc.WithAttr("content_type", remote.ContentType),
-		varc.WithAttr("etag", remote.ETag),
-		varc.WithAttr("last_modified", formatHTTPTime(remote.LastModified)),
-		varc.WithAttr("cache_control", remote.CacheControl),
-	}
-	if !remote.LastModified.IsZero() {
-		opts = append(opts, varc.WithModTime(remote.LastModified))
-	}
+	src, opts := h.cacheSourceAndOptions(r, sourceURL, remote)
 	vr, err := h.cache.Open(r.Context(), key, remote.Size, src, opts...)
 	if err != nil {
 		if h.canServeStale() {
@@ -430,6 +410,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	defer vr.Close()
 	return h.serveReader(w, r, vr, span, remoteFromReader(vr, remote), "MISS", sourceURL, key)
+}
+
+func (h *Handler) cacheSourceAndOptions(r *http.Request, sourceURL string, remote RemoteObject) (*HTTPRangeSource, []varc.OpenOption) {
+	src := &HTTPRangeSource{
+		Context:      r.Context(),
+		Client:       h.client,
+		URL:          sourceURL,
+		Headers:      h.originHeaders(r),
+		Logger:       h.logger,
+		ValidateSize: remote.Size,
+	}
+	opts := []varc.OpenOption{
+		varc.WithFingerprint(remote.Fingerprint()),
+		varc.WithStrictFingerprint(),
+		varc.WithAttr("source_url", sourceURL),
+		varc.WithAttr("content_type", remote.ContentType),
+		varc.WithAttr("etag", remote.ETag),
+		varc.WithAttr("last_modified", formatHTTPTime(remote.LastModified)),
+		varc.WithAttr("cache_control", remote.CacheControl),
+	}
+	if !remote.LastModified.IsZero() {
+		opts = append(opts, varc.WithModTime(remote.LastModified))
+	}
+	return src, opts
 }
 
 func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sourceURL, cacheStatus string) (bool, error) {
@@ -515,7 +519,13 @@ func (h *Handler) resolveSourceURL(repl *caddy.Replacer, r *http.Request) (strin
 		u.Host = strings.ToLower(u.Host)
 	}
 	if h.appendURI() {
-		u.Path = joinURLPath(u.Path, r.URL.EscapedPath())
+		rawPath := joinURLPath(u.EscapedPath(), r.URL.EscapedPath())
+		decodedPath, decodeErr := url.PathUnescape(rawPath)
+		if decodeErr != nil {
+			return "", fmt.Errorf("varc: decode joined upstream path %q: %w", rawPath, decodeErr)
+		}
+		u.Path = decodedPath
+		u.RawPath = rawPath
 		if !h.IgnoreQuery {
 			u.RawQuery = h.normalizeQuery(r.URL.RawQuery)
 		}

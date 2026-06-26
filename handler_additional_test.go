@@ -501,10 +501,21 @@ func TestHTTPRangeSourceAndRemoteParsingErrors(t *testing.T) {
 			w.Header().Set("Content-Range", "bytes 3-4/10")
 			w.WriteHeader(http.StatusPartialContent)
 			_, _ = w.Write([]byte("xx"))
+		case "/missing-range":
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("abcde"))
+		case "/bad-total":
+			w.Header().Set("Content-Range", "bytes 0-4/11")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("abcde"))
 		case "/short":
 			w.Header().Set("Content-Range", "bytes 0-4/10")
 			w.WriteHeader(http.StatusPartialContent)
 			_, _ = w.Write([]byte("xy"))
+		case "/small":
+			w.Header().Set("Content-Range", "bytes 0-2/3")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("abc"))
 		default:
 			body := []byte("abcdefghij")
 			span, err := parseSingleRange(r.Header.Get("Range"), int64(len(body)))
@@ -519,7 +530,7 @@ func TestHTTPRangeSourceAndRemoteParsingErrors(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	for _, path := range []string{"/bad-status", "/bad-range", "/short"} {
+	for _, path := range []string{"/bad-status", "/bad-range", "/missing-range", "/bad-total", "/short"} {
 		t.Run(path, func(t *testing.T) {
 			src := &HTTPRangeSource{Client: http.DefaultClient, URL: origin.URL + path, ValidateSize: 10}
 			_, err := src.ReadAt(make([]byte, 5), 0)
@@ -528,7 +539,7 @@ func TestHTTPRangeSourceAndRemoteParsingErrors(t *testing.T) {
 			}
 		})
 	}
-	src := &HTTPRangeSource{Client: http.DefaultClient, URL: origin.URL + "/ok", ValidateSize: 3}
+	src := &HTTPRangeSource{Client: http.DefaultClient, URL: origin.URL + "/small", ValidateSize: 3}
 	buf := make([]byte, 5)
 	n, err := src.ReadAt(buf, 0)
 	if err != nil || n != 3 || string(buf[:3]) != "abc" {
