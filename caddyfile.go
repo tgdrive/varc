@@ -52,9 +52,8 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    admin_allow_remote off
 //	    header Authorization "Bearer {$TOKEN}"
 //	    forward_header Authorization
-//	    block_size 1MiB
 //	    chunk_size 128MiB
-//	    chunk_streams 4
+//	    chunk_streams 0
 //	    max_size 500GiB
 //	    max_age 168h
 //	    read_ahead 16MiB
@@ -288,12 +287,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.MaxIdleConns = v
-			case "block_size":
-				v, err := nextBytes(d)
-				if err != nil {
-					return err
-				}
-				h.BlockSize = v
 			case "chunk_size":
 				v, err := nextBytes(d)
 				if err != nil {

@@ -114,6 +114,49 @@ func TestHandlerStaleIfError(t *testing.T) {
 	}
 }
 
+func TestHandlerFetchesOneOriginRangePerChunk(t *testing.T) {
+	body := []byte(strings.Repeat("0123456789abcdef", 16))
+	var gets atomic.Int64
+	var requested atomic.Value
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			return
+		}
+		gets.Add(1)
+		requested.Store(r.Header.Get("Range"))
+		span, err := parseSingleRange(r.Header.Get("Range"), int64(len(body)))
+		if err != nil {
+			writeRangeNotSatisfiable(w, int64(len(body)))
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(span.Length()))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", span.Start, span.End-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[span.Start:span.End])
+	}))
+	defer origin.Close()
+
+	h := newUnitHandler(t, origin.URL)
+	req := httptest.NewRequest(http.MethodGet, "https://edge.test/poster.jpg", nil)
+	req.Header.Set("Range", "bytes=0-0")
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, failNext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusPartialContent || rr.Body.String() != string(body[:1]) {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("origin GETs=%d, want 1", gets.Load())
+	}
+	if got := requested.Load(); got != "bytes=0-63" {
+		t.Fatalf("origin Range=%q, want bytes=0-63", got)
+	}
+}
+
 func TestHandlerAdminPinObjectPurgeAndMetrics(t *testing.T) {
 	body := []byte(strings.Repeat("x", 256))
 	origin := newRangeOrigin(t, body, nil, nil)
@@ -211,12 +254,21 @@ func TestHandlerCaddyfileNewOptions(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsRemovedBlockSizeOption(t *testing.T) {
+	d := caddyfileTestDispenser(`varc https://origin.example {
+	block_size 1MiB
+}`)
+	if err := new(Handler).UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected removed block_size option to be rejected")
+	}
+}
+
 func newUnitHandler(t *testing.T, upstream string) *Handler {
 	t.Helper()
 	opt := corevarc.DefaultOptions()
 	opt.CacheDir = t.TempDir()
-	opt.BlockSize = 32
 	opt.ChunkSize = 64
+	opt.ReadAhead = -1
 	cache, err := corevarc.New(context.Background(), opt)
 	if err != nil {
 		t.Fatal(err)

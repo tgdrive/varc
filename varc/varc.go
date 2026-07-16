@@ -54,8 +54,23 @@ const (
 	defaultFileMode os.FileMode = 0o600
 	defaultDirMode  os.FileMode = 0o700
 
-	metaVersion = 2
+	metaVersion            = 2
+	maxWriteBufferSize     = mebi
+	initialWriteBufferSize = 4 * kibi
 )
+
+// RangeSource can stream an inclusive byte range in one backend request.
+// Implement it in addition to io.ReaderAt to let varc fetch each cache chunk
+// without buffering the complete chunk or issuing one request per write.
+type RangeSource interface {
+	OpenRange(context.Context, int64, int64) (io.ReadCloser, error)
+}
+
+type readerAtRangeSource struct{ io.ReaderAt }
+
+func (s readerAtRangeSource) OpenRange(_ context.Context, start, end int64) (io.ReadCloser, error) {
+	return io.NopCloser(io.NewSectionReader(s.ReaderAt, start, end-start+1)), nil
+}
 
 var (
 	// ErrClosed is returned when the cache or reader has been closed.
@@ -159,22 +174,17 @@ type Options struct {
 	// sidecars.
 	CacheDir string
 
-	// BlockSize is the smallest persisted range granularity.  Downloads are
-	// committed block-by-block so readers waiting on the first block of a large
-	// chunk can resume quickly.
-	BlockSize int64
-
-	// ChunkSize is the preferred downloader window.  A read miss starts a
-	// downloader for at least one chunk aligned to BlockSize.  ChunkSize is capped
-	// by ChunkSizeLimit when the latter is positive.
+	// ChunkSize is the initial downloader window. Each window maps to one range
+	// request and may grow during sequential reads.
 	ChunkSize int64
 
-	// ChunkSizeLimit is a compatibility option.  When positive, ChunkSize is
-	// clamped to this limit.
+	// ChunkSizeLimit caps sequential chunk growth. A negative value allows
+	// chunks to keep doubling; zero uses the default. Set it equal to ChunkSize
+	// to keep requests fixed-size.
 	ChunkSizeLimit int64
 
-	// ChunkStreams limits the number of concurrent download goroutines across the
-	// whole cache.  Values <= 0 use a safe default.
+	// ChunkStreams controls fixed-size parallel range streams per object. Values
+	// <= 1 use sequential chunks which grow up to ChunkSizeLimit.
 	ChunkStreams int
 
 	// MaxInflightBytes is a soft limit on bytes currently being downloaded.  The
@@ -258,10 +268,9 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		CacheDir:          filepath.Join(os.TempDir(), "varc_cache"),
-		BlockSize:         mebi,
 		ChunkSize:         128 * mebi,
 		ChunkSizeLimit:    -1,
-		ChunkStreams:      4,
+		ChunkStreams:      0,
 		MaxInflightBytes:  512 * mebi,
 		CacheMaxAge:       0,
 		CacheMaxSize:      -1,
@@ -285,8 +294,8 @@ type Cache struct {
 	wg     sync.WaitGroup
 
 	dir               string
-	blockSize         int64
 	chunkSize         int64
+	chunkSizeLimit    int64
 	chunkStreams      int
 	maxInflightBytes  int64
 	cacheMaxAge       time.Duration
@@ -358,6 +367,7 @@ type entryState struct {
 	cond *sync.Cond
 
 	meta      cacheMeta
+	volatile  []byteRange
 	loaded    bool
 	tasks     map[string]*downloadTask
 	lastError error
@@ -368,13 +378,12 @@ type entryState struct {
 }
 
 type downloadTask struct {
-	state  *entryState
-	cache  *Cache
-	src    io.ReaderAt
-	start  int64
-	end    int64
-	offset int64
-	key    string
+	state *entryState
+	cache *Cache
+	src   io.ReaderAt
+	start int64
+	end   int64
+	key   string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -391,7 +400,6 @@ type cacheMeta struct {
 	CreatedAt   time.Time         `json:"created_at"`
 	UpdatedAt   time.Time         `json:"updated_at"`
 	AccessedAt  time.Time         `json:"accessed_at"`
-	BlockSize   int64             `json:"block_size"`
 	ChunkSize   int64             `json:"chunk_size"`
 	Ranges      []byteRange       `json:"ranges,omitempty"`
 	Attrs       map[string]string `json:"attrs,omitempty"`
@@ -523,8 +531,8 @@ func New(ctx context.Context, opt Options) (*Cache, error) {
 		ctx:               cacheCtx,
 		cancel:            cancel,
 		dir:               merged.CacheDir,
-		blockSize:         merged.BlockSize,
 		chunkSize:         merged.ChunkSize,
+		chunkSizeLimit:    merged.ChunkSizeLimit,
 		chunkStreams:      merged.ChunkStreams,
 		maxInflightBytes:  merged.MaxInflightBytes,
 		cacheMaxAge:       merged.CacheMaxAge,
@@ -543,7 +551,7 @@ func New(ctx context.Context, opt Options) (*Cache, error) {
 		readRetryDelay:    merged.ReadRetryDelay,
 		verifyChecksum:    merged.VerifyChecksum,
 		touchInterval:     merged.TouchInterval,
-		sem:               make(chan struct{}, merged.ChunkStreams),
+		sem:               make(chan struct{}, maxInt(1, merged.ChunkStreams)),
 		states:            make(map[string]*entryState),
 	}
 	if merged.CleanOnStart {
@@ -563,29 +571,20 @@ func validateOptions(opt *Options) error {
 	if opt.CacheDir == "" {
 		return errors.New("varc: CacheDir is required")
 	}
-	if opt.BlockSize <= 0 {
-		opt.BlockSize = mebi
-	}
 	if opt.ChunkSize <= 0 {
 		opt.ChunkSize = 128 * mebi
 	}
-	if opt.ChunkSizeLimit > 0 && opt.ChunkSize > opt.ChunkSizeLimit {
-		opt.ChunkSize = opt.ChunkSizeLimit
+	if opt.ChunkSizeLimit > 0 && opt.ChunkSizeLimit < opt.ChunkSize {
+		opt.ChunkSizeLimit = opt.ChunkSize
 	}
-	if opt.BlockSize > opt.ChunkSize {
-		opt.BlockSize = opt.ChunkSize
-	}
-	if opt.ChunkSize%opt.BlockSize != 0 {
-		opt.ChunkSize = roundUp(opt.ChunkSize, opt.BlockSize)
-	}
-	if opt.ChunkStreams <= 0 {
-		opt.ChunkStreams = 4
+	if opt.ChunkStreams < 0 {
+		opt.ChunkStreams = 0
 	}
 	if opt.ChunkStreams > 1024 {
 		return fmt.Errorf("varc: ChunkStreams too high: %d", opt.ChunkStreams)
 	}
 	if opt.MaxInflightBytes <= 0 {
-		opt.MaxInflightBytes = int64(opt.ChunkStreams) * opt.ChunkSize
+		opt.MaxInflightBytes = saturatingMul(int64(maxInt(1, opt.ChunkStreams)), opt.ChunkSize)
 	}
 	if opt.ReadAhead < 0 {
 		opt.ReadAhead = 0
@@ -693,7 +692,6 @@ func (c *Cache) Open(ctx context.Context, key string, size int64, src io.ReaderA
 				CreatedAt:   now,
 				UpdatedAt:   now,
 				AccessedAt:  now,
-				BlockSize:   c.blockSize,
 				ChunkSize:   c.chunkSize,
 				Attrs:       cloneStringMap(openOpt.attrs),
 			}
@@ -702,7 +700,6 @@ func (c *Cache) Open(ctx context.Context, key string, size int64, src io.ReaderA
 			state.meta.Key = key
 			state.meta.Size = size
 			state.meta.Version = metaVersion
-			state.meta.BlockSize = c.blockSize
 			state.meta.ChunkSize = c.chunkSize
 			state.meta.UpdatedAt = now
 			state.meta.AccessedAt = now
@@ -1183,6 +1180,10 @@ func (r *Reader) Complete() bool {
 }
 
 func (r *Reader) ensureRange(ctx context.Context, start, end int64) error {
+	return r.ensureRangeMode(ctx, start, end, true)
+}
+
+func (r *Reader) ensureRangeMode(ctx context.Context, start, end int64, allowVolatile bool) error {
 	if start < 0 || end < start {
 		return ErrInvalidRange
 	}
@@ -1205,11 +1206,15 @@ func (r *Reader) ensureRange(ctx context.Context, start, end int64) error {
 		if !fileExists(st.path) {
 			st.meta.Ranges = nil
 		}
-		if containsRange(st.meta.Ranges, start, end) {
+		available := append([]byteRange(nil), st.meta.Ranges...)
+		if allowVolatile {
+			available = append(available, st.volatile...)
+		}
+		if containsRange(available, start, end) {
 			r.meta = st.meta
 			return nil
 		}
-		missingStart, missingEnd, ok := firstMissingRange(st.meta.Ranges, start, end)
+		missingStart, missingEnd, ok := firstMissingRange(available, start, end)
 		if !ok {
 			r.meta = st.meta
 			return nil
@@ -1302,10 +1307,16 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end int
 			return
 		}
 	}
-	chunkStart := alignDown(start, c.blockSize)
-	chunkEnd := chunkStart + c.chunkSize
+	chunkStart := start
+	chunkEnd := saturatingAdd(chunkStart, c.chunkSize)
 	if chunkEnd < end {
-		chunkEnd = roundUp(end, c.blockSize)
+		chunkEnd = end
+	}
+	if c.chunkStreams > 1 {
+		parallelEnd := saturatingAdd(chunkStart, saturatingMul(int64(c.chunkStreams), c.chunkSize))
+		if parallelEnd > chunkEnd {
+			chunkEnd = parallelEnd
+		}
 	}
 	if chunkEnd > st.meta.Size {
 		chunkEnd = st.meta.Size
@@ -1321,7 +1332,6 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end int
 		src:    src,
 		start:  chunkStart,
 		end:    chunkEnd,
-		offset: chunkStart,
 		key:    key,
 		ctx:    taskCtx,
 		cancel: cancel,
@@ -1339,64 +1349,229 @@ func (c *Cache) runDownloadTask(t *downloadTask) {
 		return
 	}
 	defer c.release()
-	for {
-		if err := t.ctx.Err(); err != nil {
-			c.finishTask(t, err)
-			return
-		}
-		t.state.mu.Lock()
-		if t.offset >= t.end || t.state.removed {
-			t.done = true
-			t.state.cond.Broadcast()
-			t.state.mu.Unlock()
-			return
-		}
-		start := t.offset
-		end := min64(t.end, start+c.blockSize)
-		// Skip ranges that another downloader completed while this task waited.
-		if containsRange(t.state.meta.Ranges, start, end) {
-			t.offset = end
-			t.state.cond.Broadcast()
-			t.state.mu.Unlock()
-			continue
-		}
-		t.state.mu.Unlock()
+	src, ok := t.src.(RangeSource)
+	if !ok {
+		src = readerAtRangeSource{ReaderAt: t.src}
+	}
+	c.runStreamDownloadTask(t, src)
+}
 
-		buf, err := c.readSourceBlock(t.ctx, t.src, start, end)
-		if err != nil {
-			c.finishTask(t, err)
-			return
+func (c *Cache) runStreamDownloadTask(t *downloadTask, src RangeSource) {
+	var err error
+	if c.chunkStreams > 1 {
+		err = c.downloadParallelChunks(t, src)
+	} else {
+		err = c.downloadSequentialChunks(t, src)
+	}
+	if err != nil {
+		c.finishTask(t, err)
+		return
+	}
+	t.state.mu.Lock()
+	t.done = true
+	t.state.lastError = nil
+	t.state.cond.Broadcast()
+	t.state.mu.Unlock()
+}
+
+func (c *Cache) downloadSequentialChunks(t *downloadTask, src RangeSource) error {
+	chunkSize := c.chunkSize
+	for start := t.start; start < t.end; {
+		end := min64(t.end, saturatingAdd(start, chunkSize))
+		if err := c.downloadStreamChunk(t, src, start, end); err != nil {
+			return err
 		}
+		start = end
+		if c.chunkSizeLimit != 0 {
+			chunkSize = saturatingAdd(chunkSize, chunkSize)
+			if c.chunkSizeLimit > 0 && chunkSize > c.chunkSizeLimit {
+				chunkSize = c.chunkSizeLimit
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Cache) downloadParallelChunks(t *downloadTask, src RangeSource) error {
+	type chunkRange struct{ start, end int64 }
+	jobs := make(chan chunkRange)
+	errs := make(chan error, c.chunkStreams)
+	var wg sync.WaitGroup
+	for range c.chunkStreams {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for chunk := range jobs {
+				if err := c.downloadStreamChunk(t, src, chunk.start, chunk.end); err != nil {
+					select {
+					case errs <- err:
+					default:
+					}
+				}
+			}
+		}()
+	}
+	for start := t.start; start < t.end; {
+		end := min64(t.end, saturatingAdd(start, c.chunkSize))
+		jobs <- chunkRange{start: start, end: end}
+		start = end
+	}
+	close(jobs)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		return err
+	}
+	return nil
+}
+
+func (c *Cache) downloadStreamChunk(t *downloadTask, src RangeSource, chunkStart, chunkEnd int64) error {
+	offset := chunkStart
+	bufferSize := int64(initialWriteBufferSize)
+	var checksums []blockChecksum
+	for attempt := 0; ; attempt++ {
+		reserved := chunkEnd - offset
+		if err := c.reserveInflight(t.ctx, reserved); err != nil {
+			return err
+		}
+		body, err := src.OpenRange(t.ctx, offset, chunkEnd-1)
+		c.metricSourceReads.Add(1)
+		if err == nil && body == nil {
+			err = errors.New("varc: range source returned a nil stream")
+		}
+		if err == nil {
+			offset, bufferSize, checksums, err = c.consumeRangeStream(t, body, offset, chunkEnd, bufferSize, checksums)
+			closeErr := body.Close()
+			if err == nil && offset < chunkEnd {
+				err = closeErr
+			}
+		}
+		c.releaseInflight(reserved)
+		if err == nil {
+			return c.persistStreamProgress(t, chunkStart, offset, checksums)
+		}
+		if attempt >= c.readRetryCount || t.ctx.Err() != nil {
+			if persistErr := c.persistStreamProgress(t, chunkStart, offset, checksums); persistErr != nil {
+				return errors.Join(err, persistErr)
+			}
+			return err
+		}
+		if c.readRetryDelay > 0 {
+			select {
+			case <-time.After(time.Duration(attempt+1) * c.readRetryDelay):
+			case <-t.ctx.Done():
+				return t.ctx.Err()
+			}
+		}
+	}
+}
+
+func (c *Cache) consumeRangeStream(t *downloadTask, body io.Reader, offset, streamEnd, bufferSize int64, checksums []blockChecksum) (int64, int64, []blockChecksum, error) {
+	buffer := make([]byte, maxWriteBufferSize)
+	for offset < streamEnd {
+		if err := t.ctx.Err(); err != nil {
+			return offset, bufferSize, checksums, err
+		}
+		readSize := min64(bufferSize, streamEnd-offset)
+		n, readErr := io.ReadFull(body, buffer[:readSize])
+		if n == 0 {
+			return offset, bufferSize, checksums, readErr
+		}
+		buf := buffer[:n]
+		end := offset + int64(n)
+		c.metricSourceReadBytes.Add(int64(n))
 		checksum := uint32(0)
 		if c.verifyChecksum {
 			checksum = crc32.ChecksumIEEE(buf)
 		}
 		t.state.mu.Lock()
 		if t.state.removed {
-			t.done = true
-			t.state.cond.Broadcast()
 			t.state.mu.Unlock()
-			return
+			return offset, bufferSize, checksums, ErrClosed
 		}
-		if err := c.writeCacheBlockLocked(t.state, buf, start); err != nil {
+		if err := c.writeCacheBlockLocked(t.state, buf, offset); err != nil {
 			t.state.mu.Unlock()
-			c.finishTask(t, err)
-			return
+			return offset, bufferSize, checksums, err
 		}
-		t.state.meta.Ranges = addRange(t.state.meta.Ranges, start, end)
 		if c.verifyChecksum {
-			t.state.meta.Checksums = addChecksum(t.state.meta.Checksums, blockChecksum{Start: start, End: end, CRC32: checksum})
+			checksums = append(checksums, blockChecksum{Start: offset, End: end, CRC32: checksum})
 		}
-		t.state.meta.UpdatedAt = time.Now()
-		if err := c.saveMetaLocked(t.state); err != nil {
-			t.state.mu.Unlock()
-			c.finishTask(t, err)
-			return
+		t.state.volatile = addRange(t.state.volatile, offset, end)
+		if end < streamEnd || readErr != nil {
+			t.state.cond.Broadcast()
 		}
-		t.offset = end
-		t.state.cond.Broadcast()
 		t.state.mu.Unlock()
+		offset = end
+		if bufferSize < maxWriteBufferSize {
+			bufferSize = min64(maxWriteBufferSize, bufferSize*2)
+		}
+		if readErr != nil {
+			return offset, bufferSize, checksums, readErr
+		}
 	}
+	return offset, bufferSize, checksums, nil
+}
+
+func (c *Cache) persistStreamProgress(t *downloadTask, start, end int64, checksums []blockChecksum) error {
+	if end <= start {
+		return nil
+	}
+	t.state.mu.Lock()
+	defer t.state.mu.Unlock()
+	if t.state.removed {
+		return ErrClosed
+	}
+	oldRanges := append([]byteRange(nil), t.state.meta.Ranges...)
+	oldChecksums := append([]blockChecksum(nil), t.state.meta.Checksums...)
+	t.state.meta.Ranges = addRange(t.state.meta.Ranges, start, end)
+	for _, checksum := range checksums {
+		t.state.meta.Checksums = addChecksum(t.state.meta.Checksums, checksum)
+	}
+	t.state.meta.UpdatedAt = time.Now()
+	if err := c.saveMetaLocked(t.state); err != nil {
+		t.state.meta.Ranges = oldRanges
+		t.state.meta.Checksums = oldChecksums
+		t.state.volatile = subtractRange(t.state.volatile, start, end)
+		t.state.cond.Broadcast()
+		return err
+	}
+	t.state.volatile = subtractRange(t.state.volatile, start, end)
+	t.state.cond.Broadcast()
+	return nil
+}
+
+func saturatingAdd(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+func saturatingMul(a, b int64) int64 {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	if a > math.MaxInt64/b {
+		return math.MaxInt64
+	}
+	return a * b
+}
+
+func subtractRange(ranges []byteRange, start, end int64) []byteRange {
+	out := ranges[:0]
+	for _, r := range ranges {
+		if r.End <= start || r.Start >= end {
+			out = append(out, r)
+			continue
+		}
+		if r.Start < start {
+			out = append(out, byteRange{Start: r.Start, End: start})
+		}
+		if r.End > end {
+			out = append(out, byteRange{Start: end, End: r.End})
+		}
+	}
+	return out
 }
 
 func (c *Cache) acquire(ctx context.Context) error {
@@ -1415,50 +1590,6 @@ func (c *Cache) release() {
 	case <-c.sem:
 	default:
 	}
-}
-
-func (c *Cache) readSourceBlock(ctx context.Context, src io.ReaderAt, start, end int64) ([]byte, error) {
-	size := end - start
-	if size < 0 || size > math.MaxInt32 {
-		return nil, fmt.Errorf("%w: bad source block %d-%d", ErrInvalidRange, start, end)
-	}
-	if err := c.reserveInflight(ctx, size); err != nil {
-		return nil, err
-	}
-	defer c.releaseInflight(size)
-	buf := make([]byte, size)
-	var lastErr error
-	attempts := c.readRetryCount + 1
-	for attempt := 0; attempt < attempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		n, err := src.ReadAt(buf, start)
-		c.metricSourceReads.Add(1)
-		c.metricSourceReadBytes.Add(int64(maxInt(n, 0)))
-		if err == nil && n == len(buf) {
-			return buf, nil
-		}
-		if err == io.EOF && n == len(buf) {
-			return buf, nil
-		}
-		if err == nil {
-			err = io.ErrUnexpectedEOF
-		}
-		if err == io.EOF && n != len(buf) {
-			err = io.ErrUnexpectedEOF
-		}
-		lastErr = err
-		if attempt+1 < attempts && c.readRetryDelay > 0 {
-			delay := time.Duration(attempt+1) * c.readRetryDelay
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-	}
-	return nil, fmt.Errorf("varc: source read %d-%d failed: %w", start, end-1, lastErr)
 }
 
 func (c *Cache) reserveInflight(ctx context.Context, n int64) error {
@@ -1560,9 +1691,6 @@ func (c *Cache) saveMetaLocked(st *entryState) error {
 	if st.meta.UpdatedAt.IsZero() {
 		st.meta.UpdatedAt = time.Now()
 	}
-	if st.meta.BlockSize <= 0 {
-		st.meta.BlockSize = c.blockSize
-	}
 	if st.meta.ChunkSize <= 0 {
 		st.meta.ChunkSize = c.chunkSize
 	}
@@ -1644,7 +1772,7 @@ func syncDir(dir string) error {
 
 func validateMeta(meta cacheMeta) error {
 	if meta.Version == 0 {
-		// v1 compatibility: older metadata did not carry Version, BlockSize, or
+		// v1 compatibility: older metadata did not carry Version or
 		// timestamps.  Missing version is accepted and upgraded on the next save.
 	} else if meta.Version > metaVersion {
 		return fmt.Errorf("%w: unsupported version %d", ErrCorruptMeta, meta.Version)
@@ -1968,7 +2096,7 @@ func (r *Reader) WarmRange(ctx context.Context, start, end int64) error {
 	if end > meta.Size {
 		end = meta.Size
 	}
-	return r.ensureRange(ctx, start, end)
+	return r.ensureRangeMode(ctx, start, end, false)
 }
 
 // WarmAll downloads the entire object into the cache.
@@ -1988,7 +2116,7 @@ func (r *Reader) CopyTo(ctx context.Context, dst io.Writer) (int64, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	buf := make([]byte, min64(4*mebi, max64(r.cache.blockSize, 64*kibi)))
+	buf := make([]byte, maxWriteBufferSize)
 	var off int64
 	var total int64
 	for off < r.Size() {
@@ -2315,9 +2443,6 @@ func mergeOptions(defaults, override Options) Options {
 	if override.CacheDir != "" {
 		defaults.CacheDir = override.CacheDir
 	}
-	if override.BlockSize != 0 {
-		defaults.BlockSize = override.BlockSize
-	}
 	if override.ChunkSize != 0 {
 		defaults.ChunkSize = override.ChunkSize
 	}
@@ -2389,9 +2514,6 @@ func mergeOptions(defaults, override Options) Options {
 
 // CacheDir returns the cache root directory.
 func (c *Cache) CacheDir() string { return c.dir }
-
-// BlockSize returns the normalized block size.
-func (c *Cache) BlockSize() int64 { return c.blockSize }
 
 // ChunkSize returns the normalized chunk size.
 func (c *Cache) ChunkSize() int64 { return c.chunkSize }

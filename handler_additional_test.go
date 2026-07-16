@@ -462,7 +462,7 @@ func TestCaddyfileParsersAndValidationProvisionCleanup(t *testing.T) {
 
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()
-	h := &Handler{Upstream: "https://origin.example", CacheDir: t.TempDir(), CachePollInterval: caddy.Duration(-1), BlockSize: 32, ChunkSize: 64}
+	h := &Handler{Upstream: "https://origin.example", CacheDir: t.TempDir(), CachePollInterval: caddy.Duration(-1), ChunkSize: 64}
 	if err := h.Provision(ctx); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -556,6 +556,25 @@ func TestHTTPRangeSourceAndRemoteParsingErrors(t *testing.T) {
 	}
 }
 
+func TestHTTPRangeSourceSendsValidatorAndRejectsWrongLength(t *testing.T) {
+	var ifRange atomic.Value
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ifRange.Store(r.Header.Get("If-Range"))
+		w.Header().Set("Content-Range", "bytes 0-4/5")
+		w.Header().Set("Content-Length", "4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("abcd"))
+	}))
+	defer origin.Close()
+	src := &HTTPRangeSource{URL: origin.URL, ValidateSize: 5, IfRange: `"generation-1"`}
+	if _, err := src.OpenRange(context.Background(), 0, 4); err == nil {
+		t.Fatal("expected mismatched Content-Length error")
+	}
+	if got := ifRange.Load(); got != `"generation-1"` {
+		t.Fatalf("If-Range=%q", got)
+	}
+}
+
 func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	pairDisp := caddyfileTestDispenser(`varc https://origin {
 	header X-Test value
@@ -601,7 +620,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 		}
 	}
 	bytesDisp := caddyfileTestDispenser(`varc https://origin {
-	block_size 64KiB
+	chunk_size 64KiB
 }`)
 	for bytesDisp.Next() {
 		for nesting := bytesDisp.Nesting(); bytesDisp.NextBlock(nesting); {
@@ -611,7 +630,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 		}
 	}
 	badBytes := caddyfileTestDispenser(`varc https://origin {
-	block_size nope
+	chunk_size nope
 }`)
 	for badBytes.Next() {
 		for nesting := badBytes.Nesting(); badBytes.NextBlock(nesting); {
@@ -654,7 +673,6 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	response_header_timeout 6s
 	idle_conn_timeout 7s
 	max_idle_conns 42
-	block_size 64KiB
 	chunk_size 1MiB
 	chunk_size_limit 2MiB
 	chunk_streams 3
@@ -675,8 +693,8 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	if h.Upstream != "https://origin.example/base" || h.CacheDir != "/tmp/varc-test" || h.Key == "" || h.AppendURI == nil || *h.AppendURI || !h.IgnoreQuery || !h.SyncWrites || !h.CleanOnStart || !h.VerifyChecksum {
 		t.Fatalf("basic full parse failed: upstream=%q cache_dir=%q key=%q", h.Upstream, h.CacheDir, h.Key)
 	}
-	if h.StaticHeaders.Get("X-Token") != "static" || len(h.ForwardHeaders) != 1 || h.MaxIdleConns != 42 || h.BlockSize != 64*1024 || h.ChunkSize != 1024*1024 || h.CacheMaxSize != 5*1024*1024 || h.CacheMinFreeSpace != 6*1024*1024 || h.ShardLevel != 3 || h.ReadRetryCount != 2 {
-		t.Fatalf("numeric/header full parse failed: headers=%+v max_idle=%d block=%d chunk=%d max_size=%d", h.StaticHeaders, h.MaxIdleConns, h.BlockSize, h.ChunkSize, h.CacheMaxSize)
+	if h.StaticHeaders.Get("X-Token") != "static" || len(h.ForwardHeaders) != 1 || h.MaxIdleConns != 42 || h.ChunkSize != 1024*1024 || h.CacheMaxSize != 5*1024*1024 || h.CacheMinFreeSpace != 6*1024*1024 || h.ShardLevel != 3 || h.ReadRetryCount != 2 {
+		t.Fatalf("numeric/header full parse failed: headers=%+v max_idle=%d chunk=%d max_size=%d", h.StaticHeaders, h.MaxIdleConns, h.ChunkSize, h.CacheMaxSize)
 	}
 	if time.Duration(h.Timeout) != 5*time.Second || time.Duration(h.ProbeTimeout) != 4*time.Second || time.Duration(h.ReadRetryDelay) != 11*time.Millisecond {
 		t.Fatalf("duration full parse failed timeout=%v probe=%v retry=%v", h.Timeout, h.ProbeTimeout, h.ReadRetryDelay)

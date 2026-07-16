@@ -10,6 +10,14 @@ The important behavior is **cache-first range serving**:
 4. If the byte range is already present, serve from local disk immediately.
 5. Only on miss, probe/fetch the upstream with HTTP `Range` requests.
 
+Each `chunk_size` window is one streamed origin request. Readers can consume
+bytes while that request is active: writes start at 4 KiB and grow to 1 MiB,
+and every successful write immediately becomes reusable. Interrupted streams
+retain their exact partial range and resume at the first missing byte. With
+sequential reads, chunks double up to `chunk_size_limit`; `chunk_streams > 1`
+uses fixed-size parallel ranges instead. Enable `sync_writes` when persisted
+coverage must survive power loss with durable write ordering.
+
 That means already-cached video/media ranges do **not** create an upstream client/request.
 
 ## Layout
@@ -72,9 +80,8 @@ Then run:
             stale_if_error 1h
 
             # Cache tuning.
-            block_size 1MiB
             chunk_size 128MiB
-            chunk_streams 4
+            chunk_streams 0
             max_inflight_bytes 512MiB
             read_ahead 16MiB
             max_size 500GiB
@@ -138,8 +145,7 @@ On cache hit, no upstream HTTP request is made. On miss, the handler returns a m
               "cache_dir": "/var/cache/caddy/varc",
               "key": "{http.request.host}:{http.request.uri}",
               "chunk_size": 134217728,
-              "block_size": 1048576,
-              "chunk_streams": 4,
+              "chunk_streams": 0,
               "read_ahead": 16777216,
               "cache_max_size": 536870912000,
               "debug_headers": true

@@ -19,9 +19,8 @@
             cache_no_store off
             stale_if_error 1h
 
-            block_size 1MiB
             chunk_size 128MiB
-            chunk_streams 4
+            chunk_streams 0
             max_inflight_bytes 512MiB
             read_ahead 16MiB
             max_size 500GiB

@@ -54,9 +54,8 @@ func main() {
 
     cache, err := varc.New(ctx, varc.Options{
         CacheDir:     "./.cache/varc",
-        BlockSize:    1 << 20,       // 1 MiB committed blocks
         ChunkSize:    16 << 20,      // 16 MiB downloader windows
-        ChunkStreams: 4,             // max concurrent fetch workers
+        ChunkStreams: 0,             // sequential adaptive chunks
         ReadAhead:    4 << 20,       // opportunistic readahead
     })
     if err != nil {
@@ -64,8 +63,8 @@ func main() {
     }
     defer cache.Close()
 
-    // Any io.ReaderAt can be a source: file, bytes.Reader, HTTP range client,
-    // object store adapter, database blob reader, etc.
+    // Any io.ReaderAt can be a source. Sources that also implement RangeSource
+    // stream each chunk through one backend request.
     data := []byte("hello from a remote object")
     src := bytes.NewReader(data)
 
@@ -538,9 +537,8 @@ if err := cache.RenameKey("tmp:path", "stable:path"); err != nil {
 ```go
 opts := varc.Options{
     CacheDir:          "/var/cache/myapp/varc",
-    BlockSize:         1 << 20,        // 1 MiB
     ChunkSize:         32 << 20,       // 32 MiB
-    ChunkStreams:      8,
+    ChunkStreams:      0,              // sequential adaptive chunks
     MaxInflightBytes:  512 << 20,      // 512 MiB
     ReadAhead:         8 << 20,        // 8 MiB
     CacheMaxSize:      250 << 30,      // 250 GiB
@@ -557,10 +555,10 @@ Tuning notes:
 
 | Option | Recommendation |
 |---|---|
-| `BlockSize` | 1 MiB is a good default. Smaller blocks improve partial-read latency but increase metadata churn. |
-| `ChunkSize` | 16–128 MiB for media/range workloads. Use smaller chunks for slow or expensive backends. |
-| `ChunkStreams` | Start with 4–8. Increase only if the backend and disk can handle it. |
-| `MaxInflightBytes` | Keep below available memory. It limits concurrent block buffers. |
+| `ChunkSize` | 16–128 MiB for media/range workloads. Each chunk is one backend range request. |
+| `ChunkSizeLimit` | Sequential chunks double up to this limit. Negative allows unlimited growth; set it equal to `ChunkSize` for fixed-size requests. |
+| `ChunkStreams` | `0` or `1` uses sequential adaptive chunks. Values above `1` open that many fixed-size ranges concurrently per object. |
+| `MaxInflightBytes` | Bounds the total size of concurrently downloading chunks. |
 | `ReadAhead` | Useful for sequential media playback. Disable or reduce for purely random reads. |
 | `SyncWrites` | Enable only when crash consistency is more important than throughput. |
 | `VerifyChecksum` | Enable for paranoid local-disk verification, not for maximum throughput. |

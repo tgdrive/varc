@@ -49,8 +49,7 @@ func init() {
 //	  "upstream": "https://origin.example.com/files",
 //	  "cache_dir": "/var/cache/caddy/varc",
 //	  "chunk_size": 134217728,
-//	  "block_size": 1048576,
-//	  "chunk_streams": 4,
+//	  "chunk_streams": 0,
 //	  "read_ahead": 16777216,
 //	  "debug_headers": true
 //	}
@@ -159,7 +158,6 @@ type Handler struct {
 	ForwardHeaders []string    `json:"forward_headers,omitempty"`
 
 	// Cache tuning.  These map directly onto varc.Options.
-	BlockSize         int64          `json:"block_size,omitempty"`
 	ChunkSize         int64          `json:"chunk_size,omitempty"`
 	ChunkSizeLimit    int64          `json:"chunk_size_limit,omitempty"`
 	ChunkStreams      int            `json:"chunk_streams,omitempty"`
@@ -226,9 +224,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	opt := varc.DefaultOptions()
 	opt.CacheDir = h.CacheDir
-	if h.BlockSize > 0 {
-		opt.BlockSize = h.BlockSize
-	}
 	if h.ChunkSize > 0 {
 		opt.ChunkSize = h.ChunkSize
 	}
@@ -420,6 +415,10 @@ func (h *Handler) cacheSourceAndOptions(r *http.Request, sourceURL string, remot
 		Headers:      h.originHeaders(r),
 		Logger:       h.logger,
 		ValidateSize: remote.Size,
+		IfRange:      remote.ETag,
+	}
+	if src.IfRange == "" {
+		src.IfRange = formatHTTPTime(remote.LastModified)
 	}
 	opts := []varc.OpenOption{
 		varc.WithFingerprint(remote.Fingerprint()),

@@ -168,7 +168,6 @@ func TestOptionsValidationAccessorsStatsAndClosedPaths(t *testing.T) {
 	}
 
 	opt := testOptions(t.TempDir())
-	opt.BlockSize = 5000
 	opt.ChunkSize = 1024
 	opt.ChunkSizeLimit = 2048
 	opt.ChunkStreams = 0
@@ -184,8 +183,8 @@ func TestOptionsValidationAccessorsStatsAndClosedPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New normalized options: %v", err)
 	}
-	if c.CacheDir() != opt.CacheDir || c.BlockSize() != 1024 || c.ChunkSize() != 1024 {
-		t.Fatalf("bad accessors dir=%q block=%d chunk=%d", c.CacheDir(), c.BlockSize(), c.ChunkSize())
+	if c.CacheDir() != opt.CacheDir || c.ChunkSize() != 1024 {
+		t.Fatalf("bad accessors dir=%q chunk=%d", c.CacheDir(), c.ChunkSize())
 	}
 	if got := c.KeyPath("abc"); !strings.HasPrefix(got, c.CacheDir()) || c.MetaPath("abc") != got+".meta" {
 		t.Fatalf("bad key/meta path got=%q meta=%q", got, c.MetaPath("abc"))

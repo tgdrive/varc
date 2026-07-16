@@ -489,7 +489,6 @@ type ManifestEntry struct {
 	CreatedAt   time.Time         `json:"created_at"`
 	UpdatedAt   time.Time         `json:"updated_at"`
 	AccessedAt  time.Time         `json:"accessed_at"`
-	BlockSize   int64             `json:"block_size"`
 	ChunkSize   int64             `json:"chunk_size"`
 	Ranges      []byteRange       `json:"ranges,omitempty"`
 	Attrs       map[string]string `json:"attrs,omitempty"`
@@ -533,7 +532,6 @@ func manifestEntryFromMeta(meta cacheMeta) ManifestEntry {
 		CreatedAt:   meta.CreatedAt,
 		UpdatedAt:   meta.UpdatedAt,
 		AccessedAt:  meta.AccessedAt,
-		BlockSize:   meta.BlockSize,
 		ChunkSize:   meta.ChunkSize,
 		Ranges:      cloneRanges(meta.Ranges),
 		Attrs:       cloneStringMap(meta.Attrs),
@@ -551,7 +549,6 @@ func (e ManifestEntry) toMeta() cacheMeta {
 		CreatedAt:   e.CreatedAt,
 		UpdatedAt:   e.UpdatedAt,
 		AccessedAt:  e.AccessedAt,
-		BlockSize:   e.BlockSize,
 		ChunkSize:   e.ChunkSize,
 		Ranges:      cloneRanges(e.Ranges),
 		Attrs:       cloneStringMap(e.Attrs),
@@ -617,9 +614,6 @@ func (c *Cache) ImportManifest(ctx context.Context, r io.Reader, opt ImportOptio
 			continue
 		}
 		meta := e.toMeta()
-		if meta.BlockSize <= 0 {
-			meta.BlockSize = c.blockSize
-		}
 		if meta.ChunkSize <= 0 {
 			meta.ChunkSize = c.chunkSize
 		}

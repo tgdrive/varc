@@ -46,6 +46,54 @@ type HTTPRangeSource struct {
 	Headers      http.Header
 	Logger       *zap.Logger
 	ValidateSize int64
+	IfRange      string
+}
+
+// OpenRange opens one inclusive byte range as a stream.
+func (s *HTTPRangeSource) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
+	if start < 0 || end < start || (s.ValidateSize >= 0 && end >= s.ValidateSize) {
+		return nil, fmt.Errorf("invalid range bytes=%d-%d size=%d", start, end, s.ValidateSize)
+	}
+	if ctx == nil {
+		ctx = s.Context
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	copyHeaders(req.Header, s.Headers)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	req.Header.Set("Accept-Encoding", "identity")
+	if s.IfRange != "" {
+		req.Header.Set("If-Range", s.IfRange)
+	}
+	client := s.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("upstream range fetch %s returned %d: %s", s.URL, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	cr := resp.Header.Get("Content-Range")
+	gotStart, gotEnd, total, ok := parseContentRange(cr)
+	if !ok || gotStart != start || gotEnd != end || (s.ValidateSize >= 0 && total != s.ValidateSize) {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned unexpected Content-Range %q for bytes=%d-%d size=%d", cr, start, end, s.ValidateSize)
+	}
+	if expected := end - start + 1; resp.ContentLength >= 0 && resp.ContentLength != expected {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned Content-Length %d for bytes=%d-%d", resp.ContentLength, start, end)
+	}
+	return resp.Body, nil
 }
 
 // ReadAt fetches p from the upstream using an HTTP Range request.
@@ -65,34 +113,12 @@ func (s *HTTPRangeSource) ReadAt(p []byte, off int64) (int, error) {
 		p = p[:end-off+1]
 	}
 
-	ctx := s.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+	body, err := s.OpenRange(s.Context, off, end)
 	if err != nil {
 		return 0, err
 	}
-	copyHeaders(req.Header, s.Headers)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
-	req.Header.Set("Accept-Encoding", "identity")
-
-	resp, err := s.Client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusPartialContent {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return 0, fmt.Errorf("upstream range fetch %s returned %d: %s", s.URL, resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	cr := resp.Header.Get("Content-Range")
-	start, gotEnd, total, ok := parseContentRange(cr)
-	if !ok || start != off || gotEnd != end || (s.ValidateSize >= 0 && total != s.ValidateSize) {
-		return 0, fmt.Errorf("upstream returned unexpected Content-Range %q for bytes=%d-%d size=%d", cr, off, end, s.ValidateSize)
-	}
-	n, readErr := io.ReadFull(resp.Body, p)
+	defer body.Close()
+	n, readErr := io.ReadFull(body, p)
 	if readErr != nil {
 		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 			return n, io.ErrUnexpectedEOF

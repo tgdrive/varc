@@ -57,9 +57,8 @@ func (s *countingSource) ReadAt(p []byte, off int64) (int, error) {
 func testOptions(dir string) Options {
 	return Options{
 		CacheDir:          dir,
-		BlockSize:         1024,
 		ChunkSize:         4096,
-		ChunkStreams:      8,
+		ChunkStreams:      0,
 		MaxInflightBytes:  1 << 20,
 		ReadAhead:         0,
 		NoBackground:      true,
