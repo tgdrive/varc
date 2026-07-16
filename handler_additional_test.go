@@ -414,6 +414,31 @@ func TestHandlerOriginHeadersAndProxyBypassHeaderCopy(t *testing.T) {
 	}
 }
 
+func TestHandlerOriginHeadersWildcard(t *testing.T) {
+	h := &Handler{ForwardHeaders: []string{"*"}}
+	req := httptest.NewRequest(http.MethodGet, "https://edge.test/file", nil)
+	req.Header.Set("User-Agent", "media-client/1.0")
+	req.Header.Set("X-Client", "forwarded")
+	req.Header.Set("Connection", "X-Hop")
+	req.Header.Set("X-Hop", "discarded")
+	req.Header.Set("Range", "bytes=10-20")
+	req.Header.Set("If-None-Match", `"client-validator"`)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	headers := h.originHeaders(req)
+	if headers.Get("User-Agent") != "media-client/1.0" || headers.Get("X-Client") != "forwarded" {
+		t.Fatalf("end-to-end headers not forwarded: %v", headers)
+	}
+	for _, name := range []string{"Connection", "X-Hop", "Range", "If-None-Match"} {
+		if got := headers.Get(name); got != "" {
+			t.Fatalf("managed or hop-by-hop header %s forwarded as %q", name, got)
+		}
+	}
+	if got := headers.Get("Accept-Encoding"); got != "identity" {
+		t.Fatalf("Accept-Encoding = %q, want identity", got)
+	}
+}
+
 func TestCaddyfileParsersAndValidationProvisionCleanup(t *testing.T) {
 	if got, err := parseBytes("1.5MiB"); err != nil || got != 1572864 {
 		t.Fatalf("parseBytes MiB got=%d err=%v", got, err)

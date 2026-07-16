@@ -152,8 +152,9 @@ type Handler struct {
 	IdleConnTimeout caddy.Duration `json:"idle_conn_timeout,omitempty"`
 	MaxIdleConns    int            `json:"max_idle_conns,omitempty"`
 
-	// Header forwarding.  StaticHeaders are sent to origin after placeholder
-	// expansion.  ForwardHeaders copies named request headers to origin.
+	// Header forwarding. StaticHeaders are sent to origin after placeholder
+	// expansion. ForwardHeaders copies named request headers to origin; "*"
+	// copies all end-to-end headers except headers managed by varc.
 	StaticHeaders  http.Header `json:"headers,omitempty"`
 	ForwardHeaders []string    `json:"forward_headers,omitempty"`
 
@@ -607,6 +608,22 @@ func (h *Handler) appendURI() bool {
 
 func (h *Handler) originHeaders(r *http.Request) http.Header {
 	headers := make(http.Header)
+	forwardAll := false
+	for _, name := range h.ForwardHeaders {
+		if strings.TrimSpace(name) != "*" {
+			continue
+		}
+		forwardAll = true
+		for name, values := range r.Header {
+			if !forwardOriginHeader(name, r.Header) {
+				continue
+			}
+			for _, value := range values {
+				headers.Add(name, value)
+			}
+		}
+		break
+	}
 	for name, values := range h.StaticHeaders {
 		for _, value := range values {
 			repl := replacerFromRequest(r)
@@ -615,12 +632,38 @@ func (h *Handler) originHeaders(r *http.Request) http.Header {
 	}
 	for _, name := range h.ForwardHeaders {
 		canonical := http.CanonicalHeaderKey(name)
+		if forwardAll || canonical == "*" || !forwardOriginHeader(canonical, r.Header) {
+			continue
+		}
 		for _, value := range r.Header.Values(canonical) {
 			headers.Add(canonical, value)
 		}
 	}
 	headers.Set("Accept-Encoding", "identity")
 	return headers
+}
+
+func forwardOriginHeader(name string, requestHeaders http.Header) bool {
+	if hopByHopHeader(name) || headerListedByConnection(name, requestHeaders) {
+		return false
+	}
+	switch strings.ToLower(name) {
+	case "range", "if-range", "if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "accept-encoding":
+		return false
+	default:
+		return true
+	}
+}
+
+func headerListedByConnection(name string, headers http.Header) bool {
+	for _, value := range headers.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func setObjectHeaders(w http.ResponseWriter, remote RemoteObject, span byteSpan) {

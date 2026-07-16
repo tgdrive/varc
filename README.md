@@ -200,7 +200,8 @@ curl -X POST 'http://localhost:8080/_varc?action=warm&url=https://origin.example
 - It forces `Accept-Encoding: identity` so cached byte offsets map to real upstream bytes.
 - Cached hits intentionally skip upstream validation. This is what avoids client initialization/network calls for already cached ranges. Use stable keys, ETags/fingerprints, TTL pruning, or versioned URLs to avoid serving stale content.
 - Multi-range responses are rejected with `416`. Most media players issue single ranges.
-- If your origin requires authorization, either add a static `header` or list request headers with `forward_header`. Requests with `Authorization` bypass by default. Only turn `cache_authorization on` when the cache key includes the auth scope or every authorized user receives identical bytes.
+- Use `forward_header *` to copy all client end-to-end headers to the origin, or list individual headers with `forward_header User-Agent`. Varc excludes hop-by-hop headers and manages range, conditional, and encoding headers itself.
+- If your origin requires authorization, either add a static `header` or forward `Authorization`. Requests with `Authorization` bypass by default. Only turn `cache_authorization on` when the cache key includes the auth scope or every authorized user receives identical bytes.
 - `Set-Cookie`, `Cache-Control: private`, and `Cache-Control: no-store` bypass by default to avoid shared-cache poisoning. Enable the corresponding `cache_*` options only for controlled origins.
 - Use `stale_if_error` to serve already-cached ranges when origin probing/opening fails.
 

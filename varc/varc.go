@@ -387,6 +387,7 @@ type downloadTask struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	file   *os.File // guarded by state.mu; lazily opened on the first cache write
 	done   bool
 	err    error
 }
@@ -1353,25 +1354,18 @@ func (c *Cache) runDownloadTask(t *downloadTask) {
 	if !ok {
 		src = readerAtRangeSource{ReaderAt: t.src}
 	}
-	c.runStreamDownloadTask(t, src)
+	err := c.runStreamDownloadTask(t, src)
+	if closeErr := c.closeTaskCacheFile(t); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	c.finishTask(t, err)
 }
 
-func (c *Cache) runStreamDownloadTask(t *downloadTask, src RangeSource) {
-	var err error
+func (c *Cache) runStreamDownloadTask(t *downloadTask, src RangeSource) error {
 	if c.chunkStreams > 1 {
-		err = c.downloadParallelChunks(t, src)
-	} else {
-		err = c.downloadSequentialChunks(t, src)
+		return c.downloadParallelChunks(t, src)
 	}
-	if err != nil {
-		c.finishTask(t, err)
-		return
-	}
-	t.state.mu.Lock()
-	t.done = true
-	t.state.lastError = nil
-	t.state.cond.Broadcast()
-	t.state.mu.Unlock()
+	return c.downloadSequentialChunks(t, src)
 }
 
 func (c *Cache) downloadSequentialChunks(t *downloadTask, src RangeSource) error {
@@ -1489,7 +1483,7 @@ func (c *Cache) consumeRangeStream(t *downloadTask, body io.Reader, offset, stre
 			t.state.mu.Unlock()
 			return offset, bufferSize, checksums, ErrClosed
 		}
-		if err := c.writeCacheBlockLocked(t.state, buf, offset); err != nil {
+		if err := c.writeTaskCacheBlockLocked(t, buf, offset); err != nil {
 			t.state.mu.Unlock()
 			return offset, bufferSize, checksums, err
 		}
@@ -1621,31 +1615,47 @@ func (c *Cache) releaseInflight(n int64) {
 	c.inflightByte.Add(-n)
 }
 
-func (c *Cache) writeCacheBlockLocked(st *entryState, buf []byte, off int64) error {
+// writeTaskCacheBlockLocked writes a progressive cache segment. The caller
+// holds t.state.mu, which serializes concurrent chunk streams on the shared
+// task-owned descriptor.
+func (c *Cache) writeTaskCacheBlockLocked(t *downloadTask, buf []byte, off int64) error {
+	st := t.state
 	if err := os.MkdirAll(filepath.Dir(st.path), c.dirMode); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(st.path, os.O_CREATE|os.O_RDWR, c.fileMode)
-	if err != nil {
-		return err
+	if t.file == nil {
+		f, err := os.OpenFile(st.path, os.O_CREATE|os.O_RDWR, c.fileMode)
+		if err != nil {
+			return err
+		}
+		t.file = f
 	}
-	if _, err = f.WriteAt(buf, off); err != nil {
-		_ = f.Close()
+	if _, err := t.file.WriteAt(buf, off); err != nil {
 		return err
 	}
 	if c.syncWrites {
-		if err = f.Sync(); err != nil {
-			_ = f.Close()
+		if err := t.file.Sync(); err != nil {
 			return err
 		}
 	}
-	if err = f.Close(); err != nil {
-		return err
+	return nil
+}
+
+// closeTaskCacheFile releases the descriptor once its downloader has stopped.
+// It runs after all parallel chunk workers joined, so no writes can race it.
+func (c *Cache) closeTaskCacheFile(t *downloadTask) error {
+	st := t.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if t.file == nil {
+		return nil
 	}
+	f := t.file
+	t.file = nil
 	if !st.meta.ModTime.IsZero() {
 		_ = os.Chtimes(st.path, st.meta.ModTime, st.meta.ModTime)
 	}
-	return nil
+	return f.Close()
 }
 
 func (c *Cache) finishTask(t *downloadTask, err error) {

@@ -165,6 +165,51 @@ func TestStreamedChunkIsVisibleBeforeDurableCoverage(t *testing.T) {
 	waitForCoverage(t, c, "progressive", int64(len(src.data)))
 }
 
+func TestStreamTaskKeepsOneCacheFileOpen(t *testing.T) {
+	c := streamTestCache(t, 0)
+	src := &controlledRangeSource{
+		data:       bytes.Repeat([]byte{0x5b}, 2*int(maxWriteBufferSize)),
+		firstReady: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	r, err := c.Open(context.Background(), "task-file", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ReadAt(make([]byte, 1), 0)
+		done <- err
+	}()
+	<-src.firstReady
+
+	r.state.mu.Lock()
+	var task *downloadTask
+	for _, candidate := range r.state.tasks {
+		task = candidate
+		break
+	}
+	open := task != nil && task.file != nil
+	r.state.mu.Unlock()
+	if !open {
+		t.Fatal("active stream did not retain its cache file descriptor")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	close(src.release)
+	waitForCoverage(t, c, "task-file", int64(len(src.data)))
+
+	r.state.mu.Lock()
+	closed := task.file == nil
+	r.state.mu.Unlock()
+	if !closed {
+		t.Fatal("completed stream retained its cache file descriptor")
+	}
+}
+
 func TestInterruptedStreamDoesNotPersistPartialChunk(t *testing.T) {
 	c := streamTestCache(t, 0)
 	src := &controlledRangeSource{
