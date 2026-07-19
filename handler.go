@@ -337,7 +337,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return h.proxyBypass(w, r, sourceURL, key, reason)
 	}
 
-	served, err := h.tryServeCache(w, r, key, sourceURL, "HIT")
+	served, cachedRemote, err := h.tryServeCache(w, r, key, sourceURL, "HIT")
 	if err != nil {
 		h.metrics.errors.Add(1)
 		return err
@@ -354,21 +354,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return caddyhttp.Error(http.StatusNotFound, fmt.Errorf("varc: cache miss for %s", key))
 	}
 
-	remote, err := h.probeRemoteSingleflight(r.Context(), r, key, sourceURL)
-	if err != nil {
-		if h.canServeStale() {
-			served, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
-			if staleErr == nil && served {
-				return nil
+	var remote RemoteObject
+	if cachedRemote != nil {
+		remote = *cachedRemote
+	} else {
+		remote, err = h.probeRemoteSingleflight(r.Context(), r, key, sourceURL)
+		if err != nil {
+			if h.canServeStale() {
+				served, _, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
+				if staleErr == nil && served {
+					return nil
+				}
 			}
+			if h.PassThru {
+				h.logger.Warn("varc upstream probe failed; passing through", zap.Error(err), zap.String("url", sourceURL))
+				h.metrics.bypass.Add(1)
+				return next.ServeHTTP(w, r)
+			}
+			h.metrics.errors.Add(1)
+			return caddyhttp.Error(http.StatusBadGateway, err)
 		}
-		if h.PassThru {
-			h.logger.Warn("varc upstream probe failed; passing through", zap.Error(err), zap.String("url", sourceURL))
-			h.metrics.bypass.Add(1)
-			return next.ServeHTTP(w, r)
-		}
-		h.metrics.errors.Add(1)
-		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
 	if reason := h.responseBypassReason(remote); reason != "" {
 		h.metrics.bypass.Add(1)
@@ -396,7 +401,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	vr, err := h.cache.Open(r.Context(), key, remote.Size, src, opts...)
 	if err != nil {
 		if h.canServeStale() {
-			served, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
+			served, _, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
 			if staleErr == nil && served {
 				return nil
 			}
@@ -436,14 +441,14 @@ func (h *Handler) cacheSourceAndOptions(r *http.Request, sourceURL string, remot
 	return src, opts
 }
 
-func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sourceURL, cacheStatus string) (bool, error) {
+func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sourceURL, cacheStatus string) (bool, *RemoteObject, error) {
 	vr, err := h.cache.Open(r.Context(), key, 0, nil, varc.WithCacheOnly())
 	if err != nil {
 		if errors.Is(err, varc.ErrCacheMiss) {
-			return false, nil
+			return false, nil, nil
 		}
 		h.logger.Warn("varc cache-only open failed", zap.Error(err), zap.String("key", key))
-		return false, nil
+		return false, nil, nil
 	}
 	defer vr.Close()
 
@@ -452,20 +457,23 @@ func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sou
 	if err != nil {
 		h.metrics.rangeNotSatisfiable.Add(1)
 		writeRangeNotSatisfiable(w, vr.Size())
-		return true, nil
+		return true, &remote, nil
 	}
 	if !rangeAllowedByIfRange(r, remote.ETag, remote.LastModified) {
 		span = fullSpan(vr.Size())
 	}
 	if isNotModified(r, remote.ETag, remote.LastModified) && !span.Partial {
 		writeNotModified(w, remote)
-		return true, nil
+		return true, &remote, nil
+	}
+	if r.Method == http.MethodHead {
+		return true, &remote, h.serveReader(w, r, vr, span, remote, cacheStatus, sourceURL, key)
 	}
 	cached, err := h.cache.RangeCached(key, span.Start, span.End)
 	if err != nil || !cached {
-		return false, nil
+		return false, &remote, nil
 	}
-	return true, h.serveReader(w, r, vr, span, remote, cacheStatus, sourceURL, key)
+	return true, &remote, h.serveReader(w, r, vr, span, remote, cacheStatus, sourceURL, key)
 }
 
 func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.Reader, span byteSpan, remote RemoteObject, cacheStatus, sourceURL, key string) error {

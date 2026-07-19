@@ -85,6 +85,89 @@ func TestHandlerRangeHeadConditionalsAndUnsatisfiable(t *testing.T) {
 	}
 }
 
+func TestHandlerReusesCachedMetadataWithoutRepeatedHEAD(t *testing.T) {
+	body := bytes.Repeat([]byte("0123456789abcdef"), 64)
+	var heads atomic.Int64
+	var gets atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("ETag", `"stable-object"`)
+		w.Header().Set("Last-Modified", time.Unix(1700000000, 0).UTC().Format(http.TimeFormat))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		gets.Add(1)
+		span, err := parseSingleRange(r.Header.Get("Range"), int64(len(body)))
+		if err != nil {
+			writeRangeNotSatisfiable(w, int64(len(body)))
+			return
+		}
+		if !span.Partial {
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			_, _ = w.Write(body)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(span.Length()))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", span.Start, span.End-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[span.Start:span.End])
+	}))
+	defer origin.Close()
+
+	h := newUnitHandler(t, origin.URL)
+	h.DebugHeaders = true
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodGet, "https://edge.test/object.bin", nil)
+	firstReq.Header.Set("Range", "bytes=0-7")
+	if err := h.ServeHTTP(first, firstReq, failNext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if first.Code != http.StatusPartialContent || !bytes.Equal(first.Body.Bytes(), body[0:8]) {
+		t.Fatalf("first range status=%d body=%q", first.Code, first.Body.String())
+	}
+	if heads.Load() != 1 || gets.Load() != 1 {
+		t.Fatalf("initial origin calls heads=%d gets=%d, want 1/1", heads.Load(), gets.Load())
+	}
+
+	head := httptest.NewRecorder()
+	if err := h.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "https://edge.test/object.bin", nil), failNext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") != fmt.Sprint(len(body)) {
+		t.Fatalf("cached HEAD status=%d body=%d content-length=%q", head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
+	if head.Header().Get("X-Varc-Cache") != "HIT" {
+		t.Fatalf("cached HEAD cache status=%q, want HIT", head.Header().Get("X-Varc-Cache"))
+	}
+	if heads.Load() != 1 || gets.Load() != 1 {
+		t.Fatalf("cached HEAD reached origin: heads=%d gets=%d", heads.Load(), gets.Load())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodGet, "https://edge.test/object.bin", nil)
+	secondReq.Header.Set("Range", "bytes=256-263")
+	if err := h.ServeHTTP(second, secondReq, failNext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if second.Code != http.StatusPartialContent || !bytes.Equal(second.Body.Bytes(), body[256:264]) {
+		t.Fatalf("second range status=%d body=%q", second.Code, second.Body.String())
+	}
+	if heads.Load() != 1 {
+		t.Fatalf("uncached seek triggered another HEAD: heads=%d, want 1", heads.Load())
+	}
+	if gets.Load() != 2 {
+		t.Fatalf("range fetches=%d, want 2", gets.Load())
+	}
+}
+
 func TestHandlerPassThruAndMethodHandling(t *testing.T) {
 	h := newUnitHandler(t, "https://origin.invalid")
 	post := httptest.NewRequest(http.MethodPost, "https://edge.test/upload", nil)
