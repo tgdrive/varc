@@ -144,8 +144,8 @@ type Handler struct {
 	// keep this false and protect admin routes with Caddy matchers/auth.
 	AdminAllowRemote bool `json:"admin_allow_remote,omitempty"`
 
-	// Timeouts and transport tuning. Timeout is accepted for compatibility but
-	// is not applied to streaming response bodies.
+	// Timeout is a source read-idle timeout. It resets whenever origin bytes
+	// arrive, so it does not limit the total duration of a streaming response.
 	Timeout         caddy.Duration `json:"timeout,omitempty"`
 	ProbeTimeout    caddy.Duration `json:"probe_timeout,omitempty"`
 	DialTimeout     caddy.Duration `json:"dial_timeout,omitempty"`
@@ -255,6 +255,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ReadRetryDelay != 0 {
 		opt.ReadRetryDelay = time.Duration(h.ReadRetryDelay)
 	}
+	opt.ReadIdleTimeout = time.Duration(h.Timeout)
 	opt.SyncWrites = h.SyncWrites
 	opt.CleanOnStart = h.CleanOnStart
 	opt.VerifyChecksum = h.VerifyChecksum
@@ -297,7 +298,12 @@ func (h *Handler) Cleanup() error {
 }
 
 // ServeHTTP serves GET/HEAD requests through varc.
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (retErr error) {
+	defer func() {
+		if retErr != nil && isClientDisconnect(r.Context(), retErr) {
+			retErr = nil
+		}
+	}()
 	if h.isAdminRequest(r) {
 		return h.serveAdmin(w, r)
 	}
@@ -508,12 +514,15 @@ func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.R
 		return fmt.Errorf("varc seek: %w", err)
 	}
 	buf := make([]byte, defaultResponseBuffer)
-	_, err := io.CopyBuffer(w, io.LimitReader(vr, span.Length()), buf)
+	written, err := io.CopyBuffer(w, io.LimitReader(vr, span.Length()), buf)
 	if err != nil {
 		if isClientDisconnect(r.Context(), err) {
 			return nil
 		}
-		return fmt.Errorf("varc stream: %w", err)
+		return fmt.Errorf("varc stream after %d/%d bytes: %w", written, span.Length(), err)
+	}
+	if written != span.Length() {
+		return fmt.Errorf("varc stream short write: wrote %d of %d bytes: %w", written, span.Length(), io.ErrUnexpectedEOF)
 	}
 	return nil
 }

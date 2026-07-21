@@ -3,6 +3,7 @@ package varc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"time"
@@ -42,17 +43,11 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, ch
 	if containsRange(scheduledCoverageLocked(st), start, end) {
 		return
 	}
-	if priority == priorityBlocking {
-		c.preemptActivePreload()
-	}
 	chunkStart := start
 	if chunkSize <= 0 {
 		chunkSize = c.chunkSize
 	}
 	chunkEnd := saturatingAdd(chunkStart, chunkSize)
-	if chunkEnd > st.meta.Size {
-		chunkEnd = st.meta.Size
-	}
 	if chunkEnd > st.meta.Size {
 		chunkEnd = st.meta.Size
 	}
@@ -77,6 +72,12 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, ch
 	t.sequence = c.nextTaskSeq
 	c.nextTaskSeq++
 	c.waitingTasks = append(c.waitingTasks, t)
+	if priority == priorityBlocking {
+		active := c.activeTask
+		if active != nil && active.priority != priorityBlocking {
+			active.cancel()
+		}
+	}
 	c.schedulerCond.Broadcast()
 	c.schedulerMu.Unlock()
 	st.cond.Broadcast()
@@ -141,15 +142,6 @@ func (c *Cache) releaseTask(t *downloadTask) {
 	c.schedulerMu.Unlock()
 }
 
-func (c *Cache) preemptActivePreload() {
-	c.schedulerMu.Lock()
-	active := c.activeTask
-	if active != nil && active.priority != priorityBlocking {
-		active.cancel()
-	}
-	c.schedulerMu.Unlock()
-}
-
 func (c *Cache) promoteTask(t *downloadTask, priority taskPriority) {
 	c.schedulerMu.Lock()
 	if !t.started && priority < t.priority {
@@ -187,17 +179,45 @@ func (c *Cache) downloadStreamChunk(t *downloadTask, src RangeSource, chunkStart
 		if err := c.reserveInflight(t.ctx, reserved); err != nil {
 			return err
 		}
-		body, err := src.OpenRange(t.ctx, offset, chunkEnd-1)
+
+		attemptCtx, cancelAttempt := context.WithCancel(t.ctx)
+		progress := make(chan struct{}, 1)
+		watchdogStop := make(chan struct{})
+		watchdogStopped := make(chan struct{})
+		idleTimedOut := make(chan struct{})
+		if c.readIdleTimeout > 0 {
+			go func() {
+				defer close(watchdogStopped)
+				watchReadProgress(attemptCtx, cancelAttempt, c.readIdleTimeout, progress, watchdogStop, idleTimedOut)
+			}()
+		} else {
+			close(watchdogStopped)
+		}
+
+		body, err := src.OpenRange(attemptCtx, offset, chunkEnd-1)
 		c.metricSourceReads.Add(1)
 		if err == nil && body == nil {
 			err = errors.New("varc: range source returned a nil stream")
 		}
 		if err == nil {
-			offset, bufferSize, checksums, err = c.consumeRangeStream(t, body, offset, chunkEnd, bufferSize, checksums)
+			offset, bufferSize, checksums, err = c.consumeRangeStream(attemptCtx, t, body, offset, chunkEnd, bufferSize, checksums, progress)
 			closeErr := body.Close()
-			if err == nil && offset < chunkEnd {
+			if err == nil && closeErr != nil {
 				err = closeErr
 			}
+			if err == nil && offset < chunkEnd {
+				err = io.ErrUnexpectedEOF
+			}
+		}
+		if c.readIdleTimeout > 0 {
+			close(watchdogStop)
+		}
+		cancelAttempt()
+		<-watchdogStopped
+		select {
+		case <-idleTimedOut:
+			err = fmt.Errorf("varc: source read idle for %s: %w", c.readIdleTimeout, context.DeadlineExceeded)
+		default:
 		}
 		c.releaseInflight(reserved)
 		if err == nil {
@@ -219,15 +239,71 @@ func (c *Cache) downloadStreamChunk(t *downloadTask, src RangeSource, chunkStart
 	}
 }
 
-func (c *Cache) consumeRangeStream(t *downloadTask, body io.Reader, offset, streamEnd, bufferSize int64, checksums []blockChecksum) (int64, int64, []blockChecksum, error) {
+func watchReadProgress(ctx context.Context, cancel context.CancelFunc, timeout time.Duration, progress <-chan struct{}, stop <-chan struct{}, timedOut chan<- struct{}) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-progress:
+			resetTimer(timer, timeout)
+		case <-timer.C:
+			// Prefer already queued progress over a simultaneous timer firing.
+			select {
+			case <-progress:
+				timer.Reset(timeout)
+				continue
+			default:
+			}
+			close(timedOut)
+			cancel()
+			return
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func resetTimer(timer *time.Timer, timeout time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(timeout)
+}
+
+type progressReader struct {
+	reader   io.Reader
+	progress chan<- struct{}
+}
+
+func (r progressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		select {
+		case r.progress <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+func (c *Cache) consumeRangeStream(ctx context.Context, t *downloadTask, body io.Reader, offset, streamEnd, bufferSize int64, checksums []blockChecksum, progress chan<- struct{}) (int64, int64, []blockChecksum, error) {
 	buffer := make([]byte, maxWriteBufferSize)
+	trackedBody := progressReader{reader: body, progress: progress}
 	for offset < streamEnd {
-		if err := t.ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return offset, bufferSize, checksums, err
 		}
 		readSize := min64(bufferSize, streamEnd-offset)
-		n, readErr := io.ReadFull(body, buffer[:readSize])
+		n, readErr := io.ReadFull(trackedBody, buffer[:readSize])
 		if n == 0 {
+			if readErr == nil {
+				readErr = io.ErrNoProgress
+			}
 			return offset, bufferSize, checksums, readErr
 		}
 		buf := buffer[:n]
@@ -259,6 +335,9 @@ func (c *Cache) consumeRangeStream(t *downloadTask, body io.Reader, offset, stre
 			bufferSize = min64(maxWriteBufferSize, bufferSize*2)
 		}
 		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && offset < streamEnd {
+				readErr = io.ErrUnexpectedEOF
+			}
 			return offset, bufferSize, checksums, readErr
 		}
 	}

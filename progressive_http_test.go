@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	corevarc "github.com/tgdrive/varc/varc"
 )
 
@@ -196,5 +198,94 @@ func TestClientDisconnectErrorsAreIgnored(t *testing.T) {
 				t.Fatalf("isClientDisconnect()=%v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestServeReaderRejectsShortCachedBody(t *testing.T) {
+	data := bytes.Repeat([]byte{0x42}, 32*1024)
+	opt := corevarc.DefaultOptions()
+	opt.CacheDir = t.TempDir()
+	opt.ChunkSize = int64(len(data))
+	opt.ChunkSizeLimit = opt.ChunkSize
+	opt.PreloadChunks = 0
+	opt.NoBackground = true
+	cache, err := corevarc.New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	reader, err := cache.Open(context.Background(), "short-body", int64(len(data)), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadAt(make([]byte, len(data)), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := cache.ListEntries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries=%d, want 1", len(entries))
+	}
+	if err := os.Truncate(entries[0].Path, int64(len(data)/2)); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err = cache.Open(context.Background(), "short-body", int64(len(data)), nil, corevarc.WithCacheOnly())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/video", nil)
+	w := httptest.NewRecorder()
+	h := &Handler{}
+	err = h.serveReader(w, req, reader, byteSpan{Start: 0, End: int64(len(data)), Size: int64(len(data)), Partial: true}, RemoteObject{Size: int64(len(data))}, "HIT", "source", "short-body")
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("serveReader error=%v, want unexpected EOF", err)
+	}
+	if got := w.Header().Get("Content-Length"); got != "32768" {
+		t.Fatalf("Content-Length=%q, want 32768", got)
+	}
+	if w.Body.Len() != len(data)/2 {
+		t.Fatalf("response bytes=%d, want %d", w.Body.Len(), len(data)/2)
+	}
+}
+
+func TestServeHTTPSuppressesCanceledProbe(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer origin.Close()
+
+	ctx, cancelCtx := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancelCtx()
+	h := &Handler{
+		Upstream:     origin.URL,
+		CacheDir:     t.TempDir(),
+		ProbeTimeout: caddy.Duration(time.Second),
+	}
+	if err := h.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer h.Cleanup()
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	cancelRequest()
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/video", nil).WithContext(requestCtx)
+	w := httptest.NewRecorder()
+	nextCalled := false
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		nextCalled = true
+		return errors.New("next handler should not be called")
+	})
+	if err := h.ServeHTTP(w, req, next); err != nil {
+		t.Fatalf("canceled request returned error: %v", err)
+	}
+	if nextCalled {
+		t.Fatal("canceled request unexpectedly passed through")
 	}
 }

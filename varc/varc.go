@@ -244,6 +244,10 @@ type Options struct {
 	// backoff: delay, 2*delay, ...
 	ReadRetryDelay time.Duration
 
+	// ReadIdleTimeout aborts and retries a source range that produces no bytes
+	// for this duration. It is an idle timeout, not a total request timeout.
+	ReadIdleTimeout time.Duration
+
 	// VerifyChecksum computes a CRC32 checksum for each downloaded block and
 	// stores the value in metadata.  Reads can verify complete requested ranges
 	// only when all blocks have checksums.  This option costs CPU and metadata
@@ -272,6 +276,7 @@ func DefaultOptions() Options {
 		DirMode:           defaultDirMode,
 		ReadRetryCount:    2,
 		ReadRetryDelay:    100 * time.Millisecond,
+		ReadIdleTimeout:   30 * time.Second,
 		TouchInterval:     10 * time.Second,
 	}
 }
@@ -300,6 +305,7 @@ type Cache struct {
 	syncWrites        bool
 	readRetryCount    int
 	readRetryDelay    time.Duration
+	readIdleTimeout   time.Duration
 	verifyChecksum    bool
 	touchInterval     time.Duration
 
@@ -551,6 +557,7 @@ func New(ctx context.Context, opt Options) (*Cache, error) {
 		syncWrites:        merged.SyncWrites,
 		readRetryCount:    merged.ReadRetryCount,
 		readRetryDelay:    merged.ReadRetryDelay,
+		readIdleTimeout:   merged.ReadIdleTimeout,
 		verifyChecksum:    merged.VerifyChecksum,
 		touchInterval:     merged.TouchInterval,
 		states:            make(map[string]*entryState),
@@ -605,6 +612,9 @@ func validateOptions(opt *Options) error {
 	}
 	if opt.ReadRetryDelay < 0 {
 		opt.ReadRetryDelay = 0
+	}
+	if opt.ReadIdleTimeout < 0 {
+		opt.ReadIdleTimeout = 0
 	}
 	if opt.TouchInterval == 0 {
 		opt.TouchInterval = 10 * time.Second
@@ -1157,8 +1167,8 @@ func (r *Reader) Seek(offset int64, whence int) (int64, error) {
 	return r.pos, nil
 }
 
-// Close closes the reader and immediately cancels blocked reads and downloaders
-// that were only useful for it.
+// Close closes the reader, cancels blocked reads, and lets queued preload work
+// survive short-lived HTTP request churn.
 func (r *Reader) Close() error {
 	if r == nil {
 		return nil
@@ -1172,7 +1182,7 @@ func (r *Reader) Close() error {
 			st.readers--
 		}
 		if st.readers == 0 {
-			r.cache.cancelTasksLocked(st)
+			r.cache.cancelBlockingTasksLocked(st)
 		}
 		st.cond.Broadcast()
 		st.mu.Unlock()
@@ -1474,15 +1484,20 @@ func (c *Cache) closeTaskCacheFile(t *downloadTask) error {
 }
 
 func (c *Cache) finishTask(t *downloadTask, err error) {
-	silentPreloadCancel := err != nil && t.priority != priorityBlocking && errors.Is(err, context.Canceled)
-	if err != nil && !silentPreloadCancel {
+	intentionalCancel := err != nil && errors.Is(err, context.Canceled) && t.ctx.Err() != nil
+	reportableError := err != nil && !intentionalCancel
+	if reportableError {
 		c.metricDownloadErrors.Add(1)
 	}
 	t.state.mu.Lock()
 	t.err = err
 	t.done = true
-	if err != nil && !silentPreloadCancel {
+	switch {
+	case reportableError:
 		t.state.lastError = err
+	case err == nil:
+		// A completed retry/task supersedes an older transient entry error.
+		t.state.lastError = nil
 	}
 	t.state.cond.Broadcast()
 	t.state.mu.Unlock()
@@ -1494,6 +1509,18 @@ func (c *Cache) pruneTasksLocked(st *entryState) {
 			delete(st.tasks, k)
 		}
 	}
+}
+
+func (c *Cache) cancelBlockingTasksLocked(st *entryState) {
+	for _, t := range st.tasks {
+		if !t.done && t.priority == priorityBlocking {
+			t.cancel()
+		}
+	}
+	c.schedulerMu.Lock()
+	c.schedulerCond.Broadcast()
+	c.schedulerMu.Unlock()
+	st.cond.Broadcast()
 }
 
 func (c *Cache) cancelTasksLocked(st *entryState) {
@@ -2325,6 +2352,9 @@ func mergeOptions(defaults, override Options) Options {
 	}
 	if override.ReadRetryDelay != 0 {
 		defaults.ReadRetryDelay = override.ReadRetryDelay
+	}
+	if override.ReadIdleTimeout != 0 {
+		defaults.ReadIdleTimeout = override.ReadIdleTimeout
 	}
 	if override.VerifyChecksum {
 		defaults.VerifyChecksum = true

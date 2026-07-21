@@ -166,7 +166,7 @@ The HTTP origin must support single byte ranges.
 
 `varc` rejects malformed ranges, wrong totals, wrong content lengths, unexpected `200` responses, and truncated bodies.
 
-Streaming range bodies do not use a fixed total timeout. Dial, TLS, probe, and response-header timeouts still apply.
+Streaming range bodies do not use a fixed total timeout. `timeout` is a read-idle timeout that resets whenever origin bytes arrive. Dial, TLS, probe, and response-header timeouts still apply.
 
 ## Authentication and private responses
 
