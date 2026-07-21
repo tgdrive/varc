@@ -132,10 +132,7 @@ func (r *Reader) PlanRange(ctx context.Context, start, end int64) (RangePlan, er
 	if r == nil {
 		return RangePlan{}, ErrClosed
 	}
-	r.readMu.Lock()
-	closed := r.closed
-	r.readMu.Unlock()
-	if closed {
+	if r.closed.Load() {
 		return RangePlan{}, ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
@@ -343,7 +340,7 @@ func (c *Cache) WarmBatch(ctx context.Context, jobs []WarmJob, opt WarmOptions) 
 		return nil, ErrClosed
 	}
 	if opt.Concurrency <= 0 {
-		opt.Concurrency = c.chunkStreams
+		opt.Concurrency = c.preloadChunks + 1
 	}
 	if opt.Concurrency <= 0 {
 		opt.Concurrency = 1

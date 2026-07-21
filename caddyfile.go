@@ -53,10 +53,10 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    header Authorization "Bearer {$TOKEN}"
 //	    forward_header Authorization
 //	    chunk_size 128MiB
-//	    chunk_streams 0
+//	    chunk_size_limit 128MiB
+//	    preload_chunks 1
 //	    max_size 500GiB
 //	    max_age 168h
-//	    read_ahead 16MiB
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -299,18 +299,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.ChunkSizeLimit = v
-			case "chunk_streams":
+			case "preload_chunks":
 				v, err := nextInt(d)
 				if err != nil {
 					return err
 				}
-				h.ChunkStreams = v
-			case "max_inflight_bytes":
-				v, err := nextBytes(d)
-				if err != nil {
-					return err
-				}
-				h.MaxInflightBytes = v
+				h.PreloadChunks = v
 			case "max_size", "cache_max_size":
 				v, err := nextBytes(d)
 				if err != nil {
@@ -335,12 +329,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.CachePollInterval = caddy.Duration(dur)
-			case "read_ahead":
-				v, err := nextBytes(d)
-				if err != nil {
-					return err
-				}
-				h.ReadAhead = v
 			case "shard_level":
 				v, err := nextInt(d)
 				if err != nil {

@@ -111,8 +111,6 @@ func streamTestCache(t *testing.T, retries int) *Cache {
 	t.Helper()
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = 2 * maxWriteBufferSize
-	opt.MaxInflightBytes = 4 * maxWriteBufferSize
-	opt.ReadAhead = -1
 	opt.ReadRetryCount = retries
 	if retries == 0 {
 		opt.ReadRetryCount = -1
@@ -348,7 +346,7 @@ func TestTruncatedStreamPersistsEveryByteAndResumesExactly(t *testing.T) {
 	}
 }
 
-func TestSequentialChunksDoubleUpToLimit(t *testing.T) {
+func TestWarmAllUsesConfiguredChunkSize(t *testing.T) {
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = 64 * kibi
 	opt.ChunkSizeLimit = 256 * kibi
@@ -369,7 +367,15 @@ func TestSequentialChunksDoubleUpToLimit(t *testing.T) {
 	src.mu.Lock()
 	ranges := append([]byteRange(nil), src.ranges...)
 	src.mu.Unlock()
-	want := []byteRange{{Start: 0, End: 64 * kibi}, {Start: 64 * kibi, End: 192 * kibi}, {Start: 192 * kibi, End: 448 * kibi}}
+	want := []byteRange{
+		{Start: 0, End: 64 * kibi},
+		{Start: 64 * kibi, End: 128 * kibi},
+		{Start: 128 * kibi, End: 192 * kibi},
+		{Start: 192 * kibi, End: 256 * kibi},
+		{Start: 256 * kibi, End: 320 * kibi},
+		{Start: 320 * kibi, End: 384 * kibi},
+		{Start: 384 * kibi, End: 448 * kibi},
+	}
 	if len(ranges) != len(want) {
 		t.Fatalf("origin ranges=%+v, want %+v", ranges, want)
 	}
@@ -380,36 +386,39 @@ func TestSequentialChunksDoubleUpToLimit(t *testing.T) {
 	}
 }
 
-func TestParallelChunkStreamsOpenConcurrently(t *testing.T) {
+func TestPreloadChunksQueueDistinctRanges(t *testing.T) {
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = 64 * kibi
-	opt.ChunkStreams = 3
-	opt.MaxInflightBytes = 3 * opt.ChunkSize
+	opt.ChunkSizeLimit = 64 * kibi
+	opt.PreloadChunks = 2
 	c, err := New(context.Background(), opt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	src := &parallelRangeSource{
-		data:  bytes.Repeat([]byte{0x29}, 3*64*int(kibi)),
-		want:  3,
-		ready: make(chan struct{}),
-	}
-	r, err := c.Open(context.Background(), "parallel", int64(len(src.data)), src)
+	src := &controlledRangeSource{data: bytes.Repeat([]byte{0x29}, 3*64*int(kibi))}
+	r, err := c.Open(context.Background(), "preload-queue", int64(len(src.data)), src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := r.WarmAll(ctx); err != nil {
+	if _, err := r.ReadAt(make([]byte, 1), 0); err != nil {
 		t.Fatal(err)
 	}
-	if src.opens.Load() != 3 {
-		t.Fatalf("parallel opens=%d, want 3", src.opens.Load())
+	waitForCoverage(t, c, "preload-queue", int64(len(src.data)))
+	src.mu.Lock()
+	ranges := append([]byteRange(nil), src.ranges...)
+	src.mu.Unlock()
+	want := []byteRange{{Start: 0, End: 64 * kibi}, {Start: 64 * kibi, End: 128 * kibi}, {Start: 128 * kibi, End: 192 * kibi}}
+	if len(ranges) != len(want) {
+		t.Fatalf("origin ranges=%+v, want %+v", ranges, want)
+	}
+	for i := range want {
+		if ranges[i] != want[i] {
+			t.Fatalf("origin ranges=%+v, want %+v", ranges, want)
+		}
 	}
 }
-
 func TestRemoveDuringStreamCannotRecreateEvictedFiles(t *testing.T) {
 	c := streamTestCache(t, 0)
 	src := &controlledRangeSource{

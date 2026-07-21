@@ -268,7 +268,7 @@ func newUnitHandler(t *testing.T, upstream string) *Handler {
 	opt := corevarc.DefaultOptions()
 	opt.CacheDir = t.TempDir()
 	opt.ChunkSize = 64
-	opt.ReadAhead = -1
+	opt.PreloadChunks = -1
 	cache, err := corevarc.New(context.Background(), opt)
 	if err != nil {
 		t.Fatal(err)

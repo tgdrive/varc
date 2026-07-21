@@ -66,13 +66,27 @@ func (s *stagedSource) ReadAt(p []byte, off int64) (int, error) {
 	return s.countingSource.ReadAt(p, off)
 }
 
+type blockingRangeSource struct {
+	data    []byte
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingRangeSource) ReadAt(p []byte, off int64) (int, error) {
+	return bytes.NewReader(s.data).ReadAt(p, off)
+}
+
+func (s *blockingRangeSource) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
+	s.once.Do(func() { close(s.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func testOptions(dir string) Options {
 	return Options{
 		CacheDir:          dir,
 		ChunkSize:         4096,
-		ChunkStreams:      0,
-		MaxInflightBytes:  1 << 20,
-		ReadAhead:         0,
+		PreloadChunks:     -1,
 		NoBackground:      true,
 		ReadRetryCount:    0,
 		CacheMaxAge:       -1,
@@ -157,6 +171,67 @@ func TestSequentialReadSeekAndEOF(t *testing.T) {
 	pos, err = r.Seek(-10, io.SeekCurrent)
 	if err != nil || pos != 4990 {
 		t.Fatalf("relative seek pos=%d err=%v", pos, err)
+	}
+}
+
+func TestSeekAndCloseDoNotBlockBehindRead(t *testing.T) {
+	c, _ := openTestCache(t)
+	src := &blockingRangeSource{
+		data:    make([]byte, 64*1024),
+		started: make(chan struct{}),
+	}
+	r, err := c.Open(context.Background(), "blocked", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := r.Read(make([]byte, 4096))
+		readDone <- readErr
+	}()
+
+	select {
+	case <-src.started:
+	case <-time.After(time.Second):
+		t.Fatal("source read did not start")
+	}
+
+	seekDone := make(chan error, 1)
+	go func() {
+		pos, seekErr := r.Seek(32*1024, io.SeekStart)
+		if seekErr == nil && pos != 32*1024 {
+			seekErr = errors.New("unexpected seek position")
+		}
+		seekDone <- seekErr
+	}()
+	select {
+	case seekErr := <-seekDone:
+		if seekErr != nil {
+			t.Fatalf("Seek: %v", seekErr)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Seek blocked behind cache fill")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- r.Close() }()
+	select {
+	case closeErr := <-closeDone:
+		if closeErr != nil {
+			t.Fatalf("Close: %v", closeErr)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Close blocked behind cache fill")
+	}
+
+	select {
+	case readErr := <-readDone:
+		if readErr == nil {
+			t.Fatal("blocked Read unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read was not canceled by Close")
 	}
 }
 
@@ -587,40 +662,4 @@ func TestReadReturnsAvailablePrefixWithoutWaitingForFullBuffer(t *testing.T) {
 	}
 
 	close(src.blockAfterFirst)
-}
-
-func TestReadAheadCanSpanMultipleChunksWithoutChunkStreamsExpandingIt(t *testing.T) {
-	dir := t.TempDir()
-	opt := testOptions(dir)
-	opt.ChunkSize = 1024
-	opt.ChunkStreams = 3
-	opt.ReadAhead = 3 * opt.ChunkSize
-	opt.MaxInflightBytes = 3 * opt.ChunkSize
-	c, err := New(context.Background(), opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	if c.readAhead != 3*opt.ChunkSize {
-		t.Fatalf("read ahead was clamped: got %d want %d", c.readAhead, 3*opt.ChunkSize)
-	}
-
-	src := newCountingSource(8 * 1024)
-	r, err := c.Open(context.Background(), "multi-chunk-read-ahead", int64(len(src.data)), src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	r.scheduleReadAhead(0, 2*opt.ChunkSize)
-	r.state.mu.Lock()
-	defer r.state.mu.Unlock()
-	if len(r.state.tasks) != 1 {
-		t.Fatalf("expected one read-ahead task, got %d", len(r.state.tasks))
-	}
-	for _, task := range r.state.tasks {
-		if task.start != 0 || task.end != 2*opt.ChunkSize {
-			t.Fatalf("task expanded beyond read-ahead window: got %d-%d want 0-%d", task.start, task.end, 2*opt.ChunkSize)
-		}
-	}
 }

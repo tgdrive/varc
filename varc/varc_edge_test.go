@@ -163,16 +163,14 @@ func TestOptionsValidationAccessorsStatsAndClosedPaths(t *testing.T) {
 	if _, err := New(context.Background(), Options{CacheDir: t.TempDir(), ShardLevel: 9}); err == nil {
 		t.Fatal("expected high shard level error")
 	}
-	if _, err := New(context.Background(), Options{CacheDir: t.TempDir(), ChunkStreams: 2048}); err == nil {
+	if _, err := New(context.Background(), Options{CacheDir: t.TempDir(), PreloadChunks: 17}); err == nil {
 		t.Fatal("expected high chunk stream error")
 	}
 
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = 1024
 	opt.ChunkSizeLimit = 2048
-	opt.ChunkStreams = 0
-	opt.MaxInflightBytes = 0
-	opt.ReadAhead = 99999
+	opt.PreloadChunks = -1
 	opt.ShardLevel = -1
 	opt.FileMode = 0
 	opt.DirMode = 0

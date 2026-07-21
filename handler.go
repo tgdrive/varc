@@ -49,8 +49,8 @@ func init() {
 //	  "upstream": "https://origin.example.com/files",
 //	  "cache_dir": "/var/cache/caddy/varc",
 //	  "chunk_size": 134217728,
-//	  "chunk_streams": 0,
-//	  "read_ahead": 16777216,
+//	  "chunk_size_limit": 134217728,
+//	  "preload_chunks": 1,
 //	  "debug_headers": true
 //	}
 //
@@ -161,13 +161,11 @@ type Handler struct {
 	// Cache tuning.  These map directly onto varc.Options.
 	ChunkSize         int64          `json:"chunk_size,omitempty"`
 	ChunkSizeLimit    int64          `json:"chunk_size_limit,omitempty"`
-	ChunkStreams      int            `json:"chunk_streams,omitempty"`
-	MaxInflightBytes  int64          `json:"max_inflight_bytes,omitempty"`
+	PreloadChunks     int            `json:"preload_chunks,omitempty"`
 	CacheMaxAge       caddy.Duration `json:"cache_max_age,omitempty"`
 	CacheMaxSize      int64          `json:"cache_max_size,omitempty"`
 	CacheMinFreeSpace int64          `json:"cache_min_free_space,omitempty"`
 	CachePollInterval caddy.Duration `json:"cache_poll_interval,omitempty"`
-	ReadAhead         int64          `json:"read_ahead,omitempty"`
 	ShardLevel        int            `json:"shard_level,omitempty"`
 	SyncWrites        bool           `json:"sync_writes,omitempty"`
 	CleanOnStart      bool           `json:"clean_on_start,omitempty"`
@@ -231,11 +229,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ChunkSizeLimit != 0 {
 		opt.ChunkSizeLimit = h.ChunkSizeLimit
 	}
-	if h.ChunkStreams > 0 {
-		opt.ChunkStreams = h.ChunkStreams
-	}
-	if h.MaxInflightBytes > 0 {
-		opt.MaxInflightBytes = h.MaxInflightBytes
+	if h.PreloadChunks > 0 {
+		opt.PreloadChunks = h.PreloadChunks
 	}
 	if h.CacheMaxAge != 0 {
 		opt.CacheMaxAge = time.Duration(h.CacheMaxAge)
@@ -248,9 +243,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if h.CachePollInterval != 0 {
 		opt.CachePollInterval = time.Duration(h.CachePollInterval)
-	}
-	if h.ReadAhead != 0 {
-		opt.ReadAhead = h.ReadAhead
 	}
 	if h.ShardLevel != 0 {
 		opt.ShardLevel = h.ShardLevel

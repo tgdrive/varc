@@ -13,9 +13,9 @@
                   "upstream": "https://origin.example.com",
                   "cache_dir": "/var/cache/caddy/varc",
                   "key": "{http.request.host}:{http.request.uri}",
-                  "chunk_size": 134217728,
-                  "chunk_streams": 0,
-                  "read_ahead": 16777216,
+                  "chunk_size": 33554432,
+                  "chunk_size_limit": 134217728,
+                  "preload_chunks": 1,
                   "cache_max_size": 536870912000,
                   "debug_headers": true
                 }

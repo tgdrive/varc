@@ -708,7 +708,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 		}
 	}
 	intDisp := caddyfileTestDispenser(`varc https://origin {
-	chunk_streams 12
+	preload_chunks 12
 }`)
 	for intDisp.Next() {
 		for nesting := intDisp.Nesting(); intDisp.NextBlock(nesting); {
@@ -718,7 +718,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 		}
 	}
 	badInt := caddyfileTestDispenser(`varc https://origin {
-	chunk_streams nope
+	preload_chunks nope
 }`)
 	for badInt.Next() {
 		for nesting := badInt.Nesting(); badInt.NextBlock(nesting); {
@@ -783,13 +783,11 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	max_idle_conns 42
 	chunk_size 1MiB
 	chunk_size_limit 2MiB
-	chunk_streams 3
-	max_inflight_bytes 4MiB
+	preload_chunks 2
 	max_size 5MiB
 	min_free_space 6MiB
 	max_age 8s
 	poll_interval 9s
-	read_ahead 10KiB
 	shard_level 3
 	read_retry_count 2
 	read_retry_delay 11ms
@@ -801,7 +799,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	if h.Upstream != "https://origin.example/base" || h.CacheDir != "/tmp/varc-test" || h.Key == "" || h.AppendURI == nil || *h.AppendURI || !h.IgnoreQuery || !h.SyncWrites || !h.CleanOnStart || !h.VerifyChecksum {
 		t.Fatalf("basic full parse failed: upstream=%q cache_dir=%q key=%q", h.Upstream, h.CacheDir, h.Key)
 	}
-	if h.StaticHeaders.Get("X-Token") != "static" || len(h.ForwardHeaders) != 1 || h.MaxIdleConns != 42 || h.ChunkSize != 1024*1024 || h.CacheMaxSize != 5*1024*1024 || h.CacheMinFreeSpace != 6*1024*1024 || h.ShardLevel != 3 || h.ReadRetryCount != 2 {
+	if h.StaticHeaders.Get("X-Token") != "static" || len(h.ForwardHeaders) != 1 || h.MaxIdleConns != 42 || h.ChunkSize != 1024*1024 || h.PreloadChunks != 2 || h.CacheMaxSize != 5*1024*1024 || h.CacheMinFreeSpace != 6*1024*1024 || h.ShardLevel != 3 || h.ReadRetryCount != 2 {
 		t.Fatalf("numeric/header full parse failed: headers=%+v max_idle=%d chunk=%d max_size=%d", h.StaticHeaders, h.MaxIdleConns, h.ChunkSize, h.CacheMaxSize)
 	}
 	if time.Duration(h.Timeout) != 5*time.Second || time.Duration(h.ProbeTimeout) != 4*time.Second || time.Duration(h.ReadRetryDelay) != 11*time.Millisecond {

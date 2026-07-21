@@ -54,9 +54,9 @@ func main() {
 
     cache, err := varc.New(ctx, varc.Options{
         CacheDir:     "./.cache/varc",
-        ChunkSize:    16 << 20,      // 16 MiB downloader windows
-        ChunkStreams: 0,             // sequential adaptive chunks
-        ReadAhead:    4 << 20,       // opportunistic readahead
+        ChunkSize:      32 << 20,  // start at 32 MiB
+        ChunkSizeLimit: 128 << 20, // grow to 128 MiB
+        PreloadChunks:  1,         // prepare one future window
     })
     if err != nil {
         log.Fatal(err)
@@ -537,10 +537,9 @@ if err := cache.RenameKey("tmp:path", "stable:path"); err != nil {
 ```go
 opts := varc.Options{
     CacheDir:          "/var/cache/myapp/varc",
-    ChunkSize:         32 << 20,       // 32 MiB
-    ChunkStreams:      0,              // sequential adaptive chunks
-    MaxInflightBytes:  512 << 20,      // 512 MiB
-    ReadAhead:         8 << 20,        // 8 MiB
+    ChunkSize:         32 << 20,       // 32 MiB initial window
+    ChunkSizeLimit:    128 << 20,      // 128 MiB sequential limit
+    PreloadChunks:     1,              // one future window
     CacheMaxSize:      250 << 30,      // 250 GiB
     CacheMinFreeSpace: 10 << 30,       // 10 GiB
     CachePollInterval: 5 * time.Minute,
@@ -557,9 +556,7 @@ Tuning notes:
 |---|---|
 | `ChunkSize` | 16–128 MiB for media/range workloads. Each chunk is one backend range request. |
 | `ChunkSizeLimit` | Sequential chunks double up to this limit. Negative allows unlimited growth; set it equal to `ChunkSize` for fixed-size requests. |
-| `ChunkStreams` | `0` or `1` uses sequential adaptive chunks. Values above `1` open that many fixed-size ranges concurrently per object. |
-| `MaxInflightBytes` | Bounds the total size of concurrently downloading chunks. |
-| `ReadAhead` | Useful for sequential media playback. Disable or reduce for purely random reads. |
+| `PreloadChunks` | Number of future adaptive chunks to schedule. Concurrency and in-flight bytes are derived internally. |
 | `SyncWrites` | Enable only when crash consistency is more important than throughput. |
 | `VerifyChecksum` | Enable for paranoid local-disk verification, not for maximum throughput. |
 | `ShardLevel` | Use `2` for long-running caches with many objects. |
@@ -601,7 +598,8 @@ Common errors:
 - Multiple readers can open the same key.
 - Concurrent reads for overlapping missing ranges are coalesced.
 - A global semaphore limits active download tasks.
-- `MaxInflightBytes` limits source-read buffers.
+- One origin download is active at a time; blocking reads and seeks outrank queued preloads.
+- The in-flight byte budget is capped by `ChunkSizeLimit`.
 - `Reader` methods are safe for ordinary concurrent use, but for high-throughput code prefer one reader per request/stream.
 - `Close` cancels active downloads owned by that reader.
 - `Cache.Close` cancels background work and active cache operations.
