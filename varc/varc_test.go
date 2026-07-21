@@ -54,6 +54,18 @@ func (s *countingSource) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+type stagedSource struct {
+	*countingSource
+	blockAfterFirst chan struct{}
+}
+
+func (s *stagedSource) ReadAt(p []byte, off int64) (int, error) {
+	if s.reads.Load() > 0 {
+		<-s.blockAfterFirst
+	}
+	return s.countingSource.ReadAt(p, off)
+}
+
 func testOptions(dir string) Options {
 	return Options{
 		CacheDir:          dir,
@@ -535,5 +547,80 @@ func TestPruneInvalidMeta(t *testing.T) {
 	stats, _ := c.Prune(context.Background())
 	if stats.ReasonInvalid == 0 {
 		t.Fatalf("expected invalid meta prune: %+v", stats)
+	}
+}
+
+func TestReadReturnsAvailablePrefixWithoutWaitingForFullBuffer(t *testing.T) {
+	c, _ := openTestCache(t)
+	base := newCountingSource(32 * 1024)
+	src := &stagedSource{countingSource: base, blockAfterFirst: make(chan struct{})}
+	r, err := c.Open(context.Background(), "streaming", int64(len(base.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	buf := make([]byte, 16*1024)
+	go func() {
+		n, err := r.Read(buf)
+		done <- result{n: n, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Read returned error: %v", got.err)
+		}
+		if got.n <= 0 || got.n >= len(buf) {
+			t.Fatalf("expected partial progressive read, got n=%d", got.n)
+		}
+		if !bytes.Equal(buf[:got.n], base.data[:got.n]) {
+			t.Fatal("progressive read bytes mismatch")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read blocked waiting for the entire buffer")
+	}
+
+	close(src.blockAfterFirst)
+}
+
+func TestReadAheadCanSpanMultipleChunksWithoutChunkStreamsExpandingIt(t *testing.T) {
+	dir := t.TempDir()
+	opt := testOptions(dir)
+	opt.ChunkSize = 1024
+	opt.ChunkStreams = 3
+	opt.ReadAhead = 3 * opt.ChunkSize
+	opt.MaxInflightBytes = 3 * opt.ChunkSize
+	c, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.readAhead != 3*opt.ChunkSize {
+		t.Fatalf("read ahead was clamped: got %d want %d", c.readAhead, 3*opt.ChunkSize)
+	}
+
+	src := newCountingSource(8 * 1024)
+	r, err := c.Open(context.Background(), "multi-chunk-read-ahead", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	r.scheduleReadAhead(0, 2*opt.ChunkSize)
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	if len(r.state.tasks) != 1 {
+		t.Fatalf("expected one read-ahead task, got %d", len(r.state.tasks))
+	}
+	for _, task := range r.state.tasks {
+		if task.start != 0 || task.end != 2*opt.ChunkSize {
+			t.Fatalf("task expanded beyond read-ahead window: got %d-%d want 0-%d", task.start, task.end, 2*opt.ChunkSize)
+		}
 	}
 }

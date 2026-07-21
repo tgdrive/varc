@@ -590,9 +590,6 @@ func validateOptions(opt *Options) error {
 	if opt.ReadAhead < 0 {
 		opt.ReadAhead = 0
 	}
-	if opt.ReadAhead > opt.ChunkSize {
-		opt.ReadAhead = opt.ChunkSize
-	}
 	if opt.ShardLevel < 0 {
 		opt.ShardLevel = 0
 	}
@@ -1003,7 +1000,7 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if r.closed {
 		return 0, ErrClosed
 	}
-	n, err := r.readAtContextLocked(r.ctx, p, r.pos)
+	n, err := r.readContextLocked(r.ctx, p, r.pos)
 	r.pos += int64(n)
 	return n, err
 }
@@ -1032,7 +1029,15 @@ func (r *Reader) ReadAtContext(ctx context.Context, p []byte, off int64) (int, e
 	return r.readAtContextLocked(ctx, p, off)
 }
 
+func (r *Reader) readContextLocked(ctx context.Context, p []byte, off int64) (int, error) {
+	return r.readAtContextLockedMode(ctx, p, off, false)
+}
+
 func (r *Reader) readAtContextLocked(ctx context.Context, p []byte, off int64) (int, error) {
+	return r.readAtContextLockedMode(ctx, p, off, true)
+}
+
+func (r *Reader) readAtContextLockedMode(ctx context.Context, p []byte, off int64, requireFull bool) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -1046,24 +1051,28 @@ func (r *Reader) readAtContextLocked(ctx context.Context, p []byte, off int64) (
 	if off >= meta.Size {
 		return 0, io.EOF
 	}
-	end := off + int64(len(p))
-	finalErr := error(nil)
-	if end > meta.Size {
-		end = meta.Size
-		finalErr = io.EOF
+	bufferEnd := off + int64(len(p))
+	requestedEnd := min64(meta.Size, bufferEnd)
+	truncatedAtEOF := requestedEnd < bufferEnd
+	readEnd := requestedEnd
+	var err error
+	if requireFull {
+		err = r.ensureRange(ctx, off, requestedEnd)
+	} else {
+		readEnd, err = r.ensureReadablePrefix(ctx, off, requestedEnd)
 	}
-	if err := r.ensureRange(ctx, off, end); err != nil {
+	if err != nil {
 		return 0, err
 	}
-	if r.cache.readAhead > 0 && end < meta.Size && r.src != nil {
-		r.scheduleReadAhead(end, min64(meta.Size, end+r.cache.readAhead))
+	if r.cache.readAhead > 0 && readEnd < meta.Size && r.src != nil {
+		r.scheduleReadAhead(readEnd, min64(meta.Size, readEnd+r.cache.readAhead))
 	}
 	f, err := os.Open(r.path)
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
-	n, readErr := readFullAt(f, p[:end-off], off)
+	n, readErr := readFullAt(f, p[:readEnd-off], off)
 	r.cache.metricReads.Add(1)
 	r.cache.metricReadBytes.Add(int64(n))
 	r.cache.metricHits.Add(1)
@@ -1074,8 +1083,11 @@ func (r *Reader) readAtContextLocked(ctx context.Context, p []byte, off int64) (
 	if readErr != nil && readErr != io.EOF {
 		return n, readErr
 	}
-	if finalErr != nil {
-		return n, finalErr
+	if truncatedAtEOF && off+int64(n) >= meta.Size {
+		return n, io.EOF
+	}
+	if requireFull && n < len(p) {
+		return n, io.EOF
 	}
 	return n, readErr
 }
@@ -1184,6 +1196,56 @@ func (r *Reader) ensureRange(ctx context.Context, start, end int64) error {
 	return r.ensureRangeMode(ctx, start, end, true)
 }
 
+func (r *Reader) ensureReadablePrefix(ctx context.Context, start, end int64) (int64, error) {
+	if start < 0 || end < start {
+		return start, ErrInvalidRange
+	}
+	if start == end {
+		return end, nil
+	}
+	st := r.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return start, err
+		}
+		if r.cache.closed.Load() || st.removed {
+			return start, ErrClosed
+		}
+		if err := r.cache.reloadMetaLocked(st); err != nil {
+			return start, err
+		}
+		if !fileExists(st.path) {
+			st.meta.Ranges = nil
+		}
+		available := append([]byteRange(nil), st.meta.Ranges...)
+		for _, volatile := range st.volatile {
+			available = addRange(available, volatile.Start, volatile.End)
+		}
+		for _, availableRange := range available {
+			if availableRange.Start <= start && availableRange.End > start {
+				r.meta = st.meta
+				return min64(end, availableRange.End), nil
+			}
+		}
+		r.cache.metricMisses.Add(1)
+		r.cache.metricMissBytes.Add(end - start)
+		if r.src == nil || r.cacheOnly {
+			return start, fmt.Errorf("%w for %q at %d-%d", ErrCacheMiss, r.key, start, end-1)
+		}
+		r.cache.ensureTaskLocked(st, r.src, start, end)
+		if err := waitCond(ctx, st.cond); err != nil {
+			return start, err
+		}
+		if st.lastError != nil {
+			err := st.lastError
+			st.lastError = nil
+			return start, err
+		}
+	}
+}
+
 func (r *Reader) ensureRangeMode(ctx context.Context, start, end int64, allowVolatile bool) error {
 	if start < 0 || end < start {
 		return ErrInvalidRange
@@ -1263,9 +1325,6 @@ func (r *Reader) scheduleReadAhead(start, end int64) {
 	st := r.state
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if containsRange(st.meta.Ranges, start, end) {
-		return
-	}
 	if missingStart, missingEnd, ok := firstMissingRange(st.meta.Ranges, start, end); ok {
 		r.cache.ensureTaskLocked(st, r.src, missingStart, missingEnd)
 	}
@@ -1312,12 +1371,6 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end int
 	chunkEnd := saturatingAdd(chunkStart, c.chunkSize)
 	if chunkEnd < end {
 		chunkEnd = end
-	}
-	if c.chunkStreams > 1 {
-		parallelEnd := saturatingAdd(chunkStart, saturatingMul(int64(c.chunkStreams), c.chunkSize))
-		if parallelEnd > chunkEnd {
-			chunkEnd = parallelEnd
-		}
 	}
 	if chunkEnd > st.meta.Size {
 		chunkEnd = st.meta.Size
