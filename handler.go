@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -143,7 +144,8 @@ type Handler struct {
 	// keep this false and protect admin routes with Caddy matchers/auth.
 	AdminAllowRemote bool `json:"admin_allow_remote,omitempty"`
 
-	// Timeouts and transport tuning.
+	// Timeouts and transport tuning. Timeout is accepted for compatibility but
+	// is not applied to streaming response bodies.
 	Timeout         caddy.Duration `json:"timeout,omitempty"`
 	ProbeTimeout    caddy.Duration `json:"probe_timeout,omitempty"`
 	DialTimeout     caddy.Duration `json:"dial_timeout,omitempty"`
@@ -219,7 +221,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
-	h.client = &http.Client{Transport: transport, Timeout: time.Duration(h.Timeout)}
+	h.client = &http.Client{Transport: transport}
 
 	opt := varc.DefaultOptions()
 	opt.CacheDir = h.CacheDir
@@ -402,7 +404,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("varc open: %w", err))
 	}
 	defer vr.Close()
-	return h.serveReader(w, r, vr, span, remoteFromReader(vr, remote), "MISS", sourceURL, key)
+	cacheStatus := "MISS"
+	for _, cachedRange := range vr.CachedRanges() {
+		if cachedRange.Start < span.End && cachedRange.End > span.Start {
+			cacheStatus = "PARTIAL"
+			break
+		}
+	}
+	return h.serveReader(w, r, vr, span, remoteFromReader(vr, remote), cacheStatus, sourceURL, key)
 }
 
 func (h *Handler) cacheSourceAndOptions(r *http.Request, sourceURL string, remote RemoteObject) (*HTTPRangeSource, []varc.OpenOption) {
@@ -495,12 +504,26 @@ func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.R
 	if r.Method == http.MethodHead || span.Length() == 0 {
 		return nil
 	}
+	if _, err := vr.Seek(span.Start, io.SeekStart); err != nil {
+		return fmt.Errorf("varc seek: %w", err)
+	}
 	buf := make([]byte, defaultResponseBuffer)
-	_, err := io.CopyBuffer(w, io.NewSectionReader(vr, span.Start, span.Length()), buf)
+	_, err := io.CopyBuffer(w, io.LimitReader(vr, span.Length()), buf)
 	if err != nil {
+		if isClientDisconnect(r.Context(), err) {
+			return nil
+		}
 		return fmt.Errorf("varc stream: %w", err)
 	}
 	return nil
+}
+
+func isClientDisconnect(ctx context.Context, err error) bool {
+	return errors.Is(ctx.Err(), context.Canceled) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 func (h *Handler) resolveSourceURL(repl *caddy.Replacer, r *http.Request) (string, error) {

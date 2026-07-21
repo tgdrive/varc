@@ -307,6 +307,7 @@ type Cache struct {
 	schedulerCond  *sync.Cond
 	waitingTasks   []*downloadTask
 	activeDownload bool
+	activeTask     *downloadTask
 	nextTaskSeq    uint64
 
 	mu     sync.Mutex
@@ -1214,6 +1215,7 @@ func (r *Reader) ensureReadablePrefix(ctx context.Context, start, end int64) (in
 		return end, nil
 	}
 	st := r.state
+	missRecorded := false
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	for {
@@ -1239,8 +1241,11 @@ func (r *Reader) ensureReadablePrefix(ctx context.Context, start, end int64) (in
 				return min64(end, availableRange.End), nil
 			}
 		}
-		r.cache.metricMisses.Add(1)
-		r.cache.metricMissBytes.Add(end - start)
+		if !missRecorded {
+			r.cache.metricMisses.Add(1)
+			r.cache.metricMissBytes.Add(end - start)
+			missRecorded = true
+		}
 		if r.src == nil || r.cacheOnly {
 			return start, fmt.Errorf("%w for %q at %d-%d", ErrCacheMiss, r.key, start, end-1)
 		}
@@ -1264,6 +1269,7 @@ func (r *Reader) ensureRangeMode(ctx context.Context, start, end int64, allowVol
 		return nil
 	}
 	st := r.state
+	missRecorded := false
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	for {
@@ -1292,8 +1298,11 @@ func (r *Reader) ensureRangeMode(ctx context.Context, start, end int64, allowVol
 			r.meta = st.meta
 			return nil
 		}
-		r.cache.metricMisses.Add(1)
-		r.cache.metricMissBytes.Add(missingEnd - missingStart)
+		if !missRecorded {
+			r.cache.metricMisses.Add(1)
+			r.cache.metricMissBytes.Add(missingEnd - missingStart)
+			missRecorded = true
+		}
 		if r.src == nil || r.cacheOnly {
 			return fmt.Errorf("%w for %q at %d-%d", ErrCacheMiss, r.key, missingStart, missingEnd-1)
 		}
@@ -1465,13 +1474,14 @@ func (c *Cache) closeTaskCacheFile(t *downloadTask) error {
 }
 
 func (c *Cache) finishTask(t *downloadTask, err error) {
-	if err != nil {
+	silentPreloadCancel := err != nil && t.priority != priorityBlocking && errors.Is(err, context.Canceled)
+	if err != nil && !silentPreloadCancel {
 		c.metricDownloadErrors.Add(1)
 	}
 	t.state.mu.Lock()
 	t.err = err
 	t.done = true
-	if err != nil {
+	if err != nil && !silentPreloadCancel {
 		t.state.lastError = err
 	}
 	t.state.cond.Broadcast()

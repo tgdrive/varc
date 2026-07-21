@@ -97,7 +97,6 @@ http.handlers.varc
             max_age 168h
             poll_interval 1m
 
-            timeout 60s
             probe_timeout 15s
             dial_timeout 10s
             response_header_timeout 30s
@@ -166,6 +165,8 @@ The HTTP origin must support single byte ranges.
 - identity encoding.
 
 `varc` rejects malformed ranges, wrong totals, wrong content lengths, unexpected `200` responses, and truncated bodies.
+
+Streaming range bodies do not use a fixed total timeout. Dial, TLS, probe, and response-header timeouts still apply.
 
 ## Authentication and private responses
 

@@ -42,6 +42,9 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, ch
 	if containsRange(scheduledCoverageLocked(st), start, end) {
 		return
 	}
+	if priority == priorityBlocking {
+		c.preemptActivePreload()
+	}
 	chunkStart := start
 	if chunkSize <= 0 {
 		chunkSize = c.chunkSize
@@ -88,7 +91,7 @@ func (c *Cache) runDownloadTask(t *downloadTask) {
 		c.finishTask(t, err)
 		return
 	}
-	defer c.releaseTask()
+	defer c.releaseTask(t)
 	src, ok := t.src.(RangeSource)
 	if !ok {
 		src = readerAtRangeSource{ReaderAt: t.src}
@@ -120,6 +123,7 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 		if !c.activeDownload && best == t {
 			c.removeWaitingTaskLocked(t)
 			c.activeDownload = true
+			c.activeTask = t
 			t.started = true
 			return nil
 		}
@@ -127,10 +131,22 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 	}
 }
 
-func (c *Cache) releaseTask() {
+func (c *Cache) releaseTask(t *downloadTask) {
 	c.schedulerMu.Lock()
-	c.activeDownload = false
+	if c.activeTask == t {
+		c.activeTask = nil
+		c.activeDownload = false
+	}
 	c.schedulerCond.Broadcast()
+	c.schedulerMu.Unlock()
+}
+
+func (c *Cache) preemptActivePreload() {
+	c.schedulerMu.Lock()
+	active := c.activeTask
+	if active != nil && active.priority != priorityBlocking {
+		active.cancel()
+	}
 	c.schedulerMu.Unlock()
 }
 

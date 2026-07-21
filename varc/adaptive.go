@@ -1,10 +1,11 @@
 package varc
 
 // adaptiveReadState belongs to one Reader. Cache coverage remains shared, but
-// growth decisions must not leak between a sequential player and a random
-// reader of the same object.
+// growth decisions and chunk-window alignment must not leak between readers.
 type adaptiveReadState struct {
 	chunkSize       int64
+	windowStart     int64
+	windowEnd       int64
 	lastReadEnd     int64
 	sequentialReads int
 	initialized     bool
@@ -14,11 +15,16 @@ func (r *Reader) beginAdaptiveAccess(off int64) {
 	r.adaptiveMu.Lock()
 	defer r.adaptiveMu.Unlock()
 	if !r.adaptive.initialized {
-		r.adaptive = adaptiveReadState{chunkSize: r.cache.chunkSize, lastReadEnd: off, initialized: true}
+		r.resetAdaptiveLocked(off)
 		return
 	}
 	if off != r.adaptive.lastReadEnd {
 		r.resetAdaptiveLocked(off)
+		return
+	}
+	for off >= r.adaptive.windowEnd {
+		r.adaptive.windowStart = r.adaptive.windowEnd
+		r.adaptive.windowEnd = saturatingAdd(r.adaptive.windowStart, r.adaptive.chunkSize)
 	}
 }
 
@@ -29,13 +35,15 @@ func (r *Reader) finishAdaptiveAccess(off, n int64) {
 	r.adaptiveMu.Lock()
 	defer r.adaptiveMu.Unlock()
 	if !r.adaptive.initialized {
-		r.adaptive = adaptiveReadState{chunkSize: r.cache.chunkSize, initialized: true}
+		r.resetAdaptiveLocked(off)
 	}
 	if off == r.adaptive.lastReadEnd {
 		r.adaptive.sequentialReads++
 	} else {
 		r.adaptive.sequentialReads = 1
 		r.adaptive.chunkSize = r.cache.chunkSize
+		r.adaptive.windowStart = off
+		r.adaptive.windowEnd = saturatingAdd(off, r.cache.chunkSize)
 	}
 	r.adaptive.lastReadEnd = off + n
 
@@ -66,25 +74,45 @@ func (r *Reader) resetAdaptive(off int64) {
 }
 
 func (r *Reader) resetAdaptiveLocked(off int64) {
-	r.adaptive = adaptiveReadState{chunkSize: r.cache.chunkSize, lastReadEnd: off, initialized: true}
+	chunkSize := r.cache.chunkSize
+	r.adaptive = adaptiveReadState{
+		chunkSize:   chunkSize,
+		windowStart: off,
+		windowEnd:   saturatingAdd(off, chunkSize),
+		lastReadEnd: off,
+		initialized: true,
+	}
+}
+
+func (r *Reader) adaptiveWindow() (chunkSize, windowEnd int64) {
+	r.adaptiveMu.Lock()
+	defer r.adaptiveMu.Unlock()
+	if !r.adaptive.initialized {
+		r.resetAdaptiveLocked(0)
+	}
+	chunkSize = r.adaptive.chunkSize
+	if chunkSize <= 0 {
+		chunkSize = r.cache.chunkSize
+	}
+	windowEnd = r.adaptive.windowEnd
+	if windowEnd <= r.adaptive.windowStart {
+		windowEnd = saturatingAdd(r.adaptive.windowStart, chunkSize)
+	}
+	return chunkSize, windowEnd
 }
 
 func (r *Reader) adaptiveChunkSize() int64 {
-	r.adaptiveMu.Lock()
-	defer r.adaptiveMu.Unlock()
-	if r.adaptive.chunkSize <= 0 {
-		return r.cache.chunkSize
-	}
-	return r.adaptive.chunkSize
+	chunkSize, _ := r.adaptiveWindow()
+	return chunkSize
 }
 
 func (r *Reader) ensureAdaptiveTasksLocked(st *entryState, start, end, fileSize int64) {
-	chunkSize := r.adaptiveChunkSize()
+	chunkSize, windowEnd := r.adaptiveWindow()
 	missingStart, missingEnd, ok := firstMissingRange(scheduledCoverageLocked(st), start, end)
 	if ok {
 		r.cache.ensureTaskLocked(st, r.src, missingStart, missingEnd, chunkSize, priorityBlocking)
 	}
-	preloadStart := max64(end, saturatingAdd(start, chunkSize))
+	preloadStart := max64(end, windowEnd)
 	for i := 0; i < r.cache.preloadChunks && preloadStart < fileSize; i++ {
 		preloadEnd := min64(fileSize, saturatingAdd(preloadStart, chunkSize))
 		priority := prioritySpeculativePreload
