@@ -231,18 +231,12 @@ func (r *Reader) ensureReadablePrefix(ctx context.Context, start, end int64) (in
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	seenFailure := st.failureSeq
-	if err := r.cache.reloadMetaLocked(st); err != nil {
-		return start, err
-	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return start, err
 		}
 		if r.cache.closed.Load() || st.removed || r.generation != st.generation {
 			return start, ErrClosed
-		}
-		if !fileExists(st.path) {
-			st.meta.Ranges = nil
 		}
 		available := append([]byteRange(nil), st.meta.Ranges...)
 		for _, volatile := range st.volatile {
@@ -284,18 +278,12 @@ func (r *Reader) ensureRangeMode(ctx context.Context, start, end int64, allowVol
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	seenFailure := st.failureSeq
-	if err := r.cache.reloadMetaLocked(st); err != nil {
-		return err
-	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if r.cache.closed.Load() || st.removed || r.generation != st.generation {
 			return ErrClosed
-		}
-		if !fileExists(st.path) {
-			st.meta.Ranges = nil
 		}
 		available := append([]byteRange(nil), st.meta.Ranges...)
 		if allowVolatile {

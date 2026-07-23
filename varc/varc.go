@@ -735,6 +735,7 @@ func (c *Cache) Open(ctx context.Context, key string, size int64, src io.ReaderA
 		c.metricOpenErrors.Add(1)
 		return nil, err
 	}
+	state.lastTouch = now
 	if !state.meta.ModTime.IsZero() && fileExists(path) {
 		_ = os.Chtimes(path, state.meta.ModTime, state.meta.ModTime)
 	}

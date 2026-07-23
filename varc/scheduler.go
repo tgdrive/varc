@@ -6,8 +6,13 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync"
 	"time"
 )
+
+var downloadBufferPool = sync.Pool{
+	New: func() any { return make([]byte, maxWriteBufferSize) },
+}
 
 type taskPriority uint8
 
@@ -327,7 +332,8 @@ func (r progressReader) Read(p []byte) (int, error) {
 }
 
 func (c *Cache) consumeRangeStream(ctx context.Context, t *downloadTask, body io.Reader, offset, streamEnd, bufferSize int64, checksums []blockChecksum, progress chan<- struct{}) (int64, int64, []blockChecksum, error) {
-	buffer := make([]byte, maxWriteBufferSize)
+	buffer := downloadBufferPool.Get().([]byte)
+	defer downloadBufferPool.Put(buffer)
 	trackedBody := progressReader{reader: body, progress: progress}
 	for offset < streamEnd {
 		if err := ctx.Err(); err != nil {
