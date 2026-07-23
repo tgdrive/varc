@@ -226,10 +226,17 @@ func TestBlockingSeekRunsBeforeQueuedPreloads(t *testing.T) {
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		c.schedulerMu.Lock()
-		queued := len(c.waitingTasks)
-		c.schedulerMu.Unlock()
-		if queued >= 3 { // two preloads plus the new blocking seek
+		st := r.state
+		st.mu.Lock()
+		blockingQueued := false
+		for _, task := range st.tasks {
+			if !task.done && task.priority == priorityBlocking && task.start == seekOffset {
+				blockingQueued = true
+				break
+			}
+		}
+		st.mu.Unlock()
+		if blockingQueued {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -255,5 +262,50 @@ func TestBlockingSeekRunsBeforeQueuedPreloads(t *testing.T) {
 	}
 	if err := <-seekDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRandomSeekCancelsOnlyStaleReaderPreloads(t *testing.T) {
+	const chunkSize int64 = 64
+	opt := testOptions(t.TempDir())
+	opt.ChunkSize = chunkSize
+	opt.ChunkSizeLimit = chunkSize
+	opt.PreloadChunks = 1
+	c, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	src := bytes.NewReader(bytes.Repeat([]byte{0x31}, 6*int(chunkSize)))
+	r1, err := c.Open(context.Background(), "shared-preload-ownership", int64(src.Len()), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1.Close()
+	r2, err := c.Open(context.Background(), "shared-preload-ownership", int64(src.Len()), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+
+	st := r1.state
+	st.mu.Lock()
+	r1.ensureAdaptiveTasksLocked(st, 0, 1, int64(src.Len()))
+	r2.ensureAdaptiveTasksLocked(st, 0, 1, int64(src.Len()))
+	preload := st.tasks[rangeKey(chunkSize, 2*chunkSize)]
+	st.mu.Unlock()
+	if preload == nil {
+		t.Fatal("shared preload was not scheduled")
+	}
+
+	r1.beginAdaptiveAccess(4 * chunkSize)
+	if err := preload.ctx.Err(); err != nil {
+		t.Fatalf("preload canceled while second reader still owned it: %v", err)
+	}
+
+	r2.beginAdaptiveAccess(5 * chunkSize)
+	if !errors.Is(preload.ctx.Err(), context.Canceled) {
+		t.Fatalf("stale preload context error=%v, want context canceled", preload.ctx.Err())
 	}
 }

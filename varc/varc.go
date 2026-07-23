@@ -390,14 +390,15 @@ type downloadTask struct {
 	end   int64
 	key   string
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	priority taskPriority
-	sequence uint64
-	started  bool
-	file     *os.File // guarded by state.mu; lazily opened on the first cache write
-	done     bool
-	err      error
+	ctx           context.Context
+	cancel        context.CancelFunc
+	priority      taskPriority
+	sequence      uint64
+	started       bool
+	preloadOwners map[*Reader]struct{}
+	file          *os.File // guarded by state.mu; lazily opened on the first cache write
+	done          bool
+	err           error
 }
 
 type cacheMeta struct {
@@ -1167,8 +1168,8 @@ func (r *Reader) Seek(offset int64, whence int) (int64, error) {
 	return r.pos, nil
 }
 
-// Close closes the reader, cancels blocked reads, and lets queued preload work
-// survive short-lived HTTP request churn.
+// Close closes the reader and cancels all outstanding work once no readers
+// remain for the cache entry.
 func (r *Reader) Close() error {
 	if r == nil {
 		return nil
@@ -1182,7 +1183,7 @@ func (r *Reader) Close() error {
 			st.readers--
 		}
 		if st.readers == 0 {
-			r.cache.cancelBlockingTasksLocked(st)
+			r.cache.cancelTasksLocked(st)
 		}
 		st.cond.Broadcast()
 		st.mu.Unlock()

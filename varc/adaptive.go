@@ -13,19 +13,22 @@ type adaptiveReadState struct {
 
 func (r *Reader) beginAdaptiveAccess(off int64) {
 	r.adaptiveMu.Lock()
-	defer r.adaptiveMu.Unlock()
 	if !r.adaptive.initialized {
 		r.resetAdaptiveLocked(off)
+		r.adaptiveMu.Unlock()
 		return
 	}
 	if off != r.adaptive.lastReadEnd {
 		r.resetAdaptiveLocked(off)
+		r.adaptiveMu.Unlock()
+		r.cancelStalePreloads()
 		return
 	}
 	for off >= r.adaptive.windowEnd {
 		r.adaptive.windowStart = r.adaptive.windowEnd
 		r.adaptive.windowEnd = saturatingAdd(r.adaptive.windowStart, r.adaptive.chunkSize)
 	}
+	r.adaptiveMu.Unlock()
 }
 
 func (r *Reader) finishAdaptiveAccess(off, n int64) {
@@ -69,8 +72,18 @@ func (r *Reader) finishAdaptiveAccess(off, n int64) {
 
 func (r *Reader) resetAdaptive(off int64) {
 	r.adaptiveMu.Lock()
-	defer r.adaptiveMu.Unlock()
 	r.resetAdaptiveLocked(off)
+	r.adaptiveMu.Unlock()
+	r.cancelStalePreloads()
+}
+
+func (r *Reader) cancelStalePreloads() {
+	if r == nil || r.cache == nil || r.state == nil {
+		return
+	}
+	r.state.mu.Lock()
+	r.cache.cancelReaderPreloadsLocked(r.state, r)
+	r.state.mu.Unlock()
 }
 
 func (r *Reader) resetAdaptiveLocked(off int64) {
@@ -119,7 +132,7 @@ func (r *Reader) ensureAdaptiveTasksLocked(st *entryState, start, end, fileSize 
 		if i == 0 {
 			priority = priorityImmediatePreload
 		}
-		r.cache.ensureTaskLocked(st, r.src, preloadStart, preloadEnd, chunkSize, priority)
+		r.cache.ensurePreloadTaskLocked(st, r.src, preloadStart, preloadEnd, chunkSize, priority, r)
 		preloadStart = preloadEnd
 	}
 }

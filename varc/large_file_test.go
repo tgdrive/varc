@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 )
 
 type recordedGeneratedSource struct {
@@ -166,5 +167,83 @@ func TestLargeFileSequentialReadHasNoDuplicateOrMissingFetches(t *testing.T) {
 	}
 	if after.Misses != before.Misses {
 		t.Fatalf("fully cached replay added misses: before=%d after=%d", before.Misses, after.Misses)
+	}
+}
+
+func TestLargeFileFrequentRandomSeeksRemainCorrect(t *testing.T) {
+	const (
+		fileSize  = int64(20 << 30)
+		chunkSize = int64(1 << 20)
+		readSize  = 64 << 10
+	)
+
+	opt := testOptions(t.TempDir())
+	opt.ChunkSize = chunkSize
+	opt.ChunkSizeLimit = 4 * chunkSize
+	opt.PreloadChunks = 2
+	cache, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	src := &recordedGeneratedSource{size: fileSize}
+	reader, err := cache.Open(context.Background(), "large-random-seeks", fileSize, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	offsets := []int64{
+		0,
+		17*chunkSize + 123,
+		fileSize - readSize,
+		3*chunkSize + 77,
+		12<<30 + 19,
+		8*chunkSize + 4096,
+		19<<30 + 333,
+		2<<30 + 55,
+		64*chunkSize + 7,
+		15<<30 + 2048,
+		5*chunkSize + 99,
+		10<<30 + 8191,
+	}
+	buf := make([]byte, readSize)
+	for i, off := range offsets {
+		n, err := reader.ReadAt(buf, off)
+		if err != nil {
+			t.Fatalf("seek %d at %d failed: %v", i, off, err)
+		}
+		if n != len(buf) {
+			t.Fatalf("seek %d at %d read %d bytes, want %d", i, off, n, len(buf))
+		}
+		verifyGeneratedBytes(t, buf, off)
+	}
+
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := make(chan struct{})
+	go func() {
+		cache.wg.Wait()
+		close(deadline)
+	}()
+	select {
+	case <-deadline:
+	case <-time.After(2 * time.Second):
+		t.Fatal("downloads did not stop after final reader close")
+	}
+
+	reader.state.mu.Lock()
+	for _, task := range reader.state.tasks {
+		if !task.done {
+			reader.state.mu.Unlock()
+			t.Fatalf("task %d-%d remained active after final reader close", task.start, task.end)
+		}
+	}
+	reader.state.mu.Unlock()
+
+	if got := src.snapshotRanges(); len(got) == 0 {
+		t.Fatal("random seeks made no origin requests")
 	}
 }

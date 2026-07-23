@@ -33,9 +33,23 @@ func scheduledCoverageLocked(st *entryState) []byteRange {
 }
 
 func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, chunkSize int64, priority taskPriority) {
+	c.ensureOwnedTaskLocked(st, src, start, end, chunkSize, priority, nil)
+}
+
+func (c *Cache) ensurePreloadTaskLocked(st *entryState, src io.ReaderAt, start, end, chunkSize int64, priority taskPriority, owner *Reader) {
+	c.ensureOwnedTaskLocked(st, src, start, end, chunkSize, priority, owner)
+}
+
+func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, end, chunkSize int64, priority taskPriority, owner *Reader) {
 	c.pruneTasksLocked(st)
 	for _, task := range st.tasks {
 		if !task.done && task.err == nil && task.start <= start && task.end >= end {
+			if owner != nil && task.priority != priorityBlocking {
+				if task.preloadOwners == nil {
+					task.preloadOwners = make(map[*Reader]struct{})
+				}
+				task.preloadOwners[owner] = struct{}{}
+			}
 			c.promoteTask(task, priority)
 			return
 		}
@@ -67,6 +81,9 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, ch
 		cancel:   cancel,
 		priority: priority,
 	}
+	if owner != nil {
+		t.preloadOwners = map[*Reader]struct{}{owner: {}}
+	}
 	st.tasks[key] = t
 	c.schedulerMu.Lock()
 	t.sequence = c.nextTaskSeq
@@ -83,6 +100,22 @@ func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, ch
 	st.cond.Broadcast()
 	c.wg.Add(1)
 	go c.runDownloadTask(t)
+}
+
+func (c *Cache) cancelReaderPreloadsLocked(st *entryState, owner *Reader) {
+	for _, task := range st.tasks {
+		if task.done || task.priority == priorityBlocking || task.preloadOwners == nil {
+			continue
+		}
+		delete(task.preloadOwners, owner)
+		if len(task.preloadOwners) == 0 {
+			task.cancel()
+		}
+	}
+	c.schedulerMu.Lock()
+	c.schedulerCond.Broadcast()
+	c.schedulerMu.Unlock()
+	st.cond.Broadcast()
 }
 
 func (c *Cache) runDownloadTask(t *downloadTask) {

@@ -92,7 +92,7 @@ func TestBlockingSeekPreemptsActivePreload(t *testing.T) {
 	}
 }
 
-func TestPreloadSurvivesReaderClose(t *testing.T) {
+func TestPreloadCanceledWhenLastReaderCloses(t *testing.T) {
 	const chunkSize int64 = 64
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = chunkSize
@@ -104,29 +104,30 @@ func TestPreloadSurvivesReaderClose(t *testing.T) {
 	}
 	defer c.Close()
 
-	data := bytes.Repeat([]byte{0x6b}, 3*int(chunkSize))
-	src := bytes.NewReader(data)
-	r, err := c.Open(context.Background(), "preload-survives-close", int64(len(data)), src)
+	src := &preemptibleRangeSource{
+		data:           bytes.Repeat([]byte{0x6b}, 3*int(chunkSize)),
+		preloadStarted: make(chan struct{}),
+		preloadStopped: make(chan struct{}),
+	}
+	r, err := c.Open(context.Background(), "preload-canceled-on-close", int64(len(src.data)), src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.ReadAt(make([]byte, 1), 0); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case <-src.preloadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("preload did not start")
+	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	deadline := time.Now().Add(time.Second)
-	for {
-		cached, err := c.RangeCached("preload-survives-close", chunkSize, 2*chunkSize)
-		if err == nil && cached {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("preload was canceled when reader closed")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-src.preloadStopped:
+	case <-time.After(time.Second):
+		t.Fatal("closing the last reader did not cancel active preload")
 	}
 }
 
