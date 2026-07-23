@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -122,6 +123,10 @@ type Handler struct {
 	// probe/open path fails.  This is range-scoped and does not refresh in background.
 	StaleIfError caddy.Duration `json:"stale_if_error,omitempty"`
 
+	// RevalidateInterval controls how often cached objects are probed before
+	// serving. Zero preserves immutable-object behavior and disables probes.
+	RevalidateInterval caddy.Duration `json:"revalidate_interval,omitempty"`
+
 	// CacheOnly serves only already-cached complete/range data.  No upstream probe
 	// or fetch is performed on misses.
 	CacheOnly bool `json:"cache_only,omitempty"`
@@ -179,8 +184,11 @@ type Handler struct {
 	cache  *varc.Cache
 	client *http.Client
 
-	metrics handlerMetrics
-	flights *flightGroup
+	metrics      handlerMetrics
+	flights      *flightGroup
+	runtimeMu    sync.Mutex
+	validationMu sync.Mutex
+	validatedAt  map[string]time.Time
 }
 
 // CaddyModule returns the Caddy module information.
@@ -337,13 +345,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return h.proxyBypass(w, r, sourceURL, key, reason)
 	}
 
-	served, cachedRemote, err := h.tryServeCache(w, r, key, sourceURL, "HIT")
-	if err != nil {
-		h.metrics.errors.Add(1)
-		return err
-	}
-	if served {
-		return nil
+	var cachedRemote *RemoteObject
+	if !h.shouldRevalidate(key) {
+		served, remote, cacheErr := h.tryServeCache(w, r, key, sourceURL, "HIT")
+		if cacheErr != nil {
+			h.metrics.errors.Add(1)
+			return caddyhttp.Error(http.StatusInternalServerError, cacheErr)
+		}
+		cachedRemote = remote
+		if served {
+			return nil
+		}
 	}
 	if h.CacheOnly {
 		if h.PassThru {
@@ -360,7 +372,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	} else {
 		remote, err = h.probeRemoteSingleflight(r.Context(), r, key, sourceURL)
 		if err != nil {
-			if h.canServeStale() {
+			if h.canServeStaleKey(key) {
 				served, _, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
 				if staleErr == nil && served {
 					return nil
@@ -374,6 +386,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			h.metrics.errors.Add(1)
 			return caddyhttp.Error(http.StatusBadGateway, err)
 		}
+		h.markValidated(key)
 	}
 	if reason := h.responseBypassReason(remote); reason != "" {
 		h.metrics.bypass.Add(1)
@@ -397,10 +410,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
+	wasCached, _ := h.cache.RangeCached(key, span.Start, span.End, varc.WithFingerprint(remote.Fingerprint()), varc.WithStrictFingerprint())
 	src, opts := h.cacheSourceAndOptions(r, sourceURL, remote)
 	vr, err := h.cache.Open(r.Context(), key, remote.Size, src, opts...)
 	if err != nil {
-		if h.canServeStale() {
+		if h.canServeStaleKey(key) {
 			served, _, staleErr := h.tryServeCache(w, r, key, sourceURL, "STALE")
 			if staleErr == nil && served {
 				return nil
@@ -411,9 +425,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	defer vr.Close()
 	cacheStatus := "MISS"
+	if wasCached {
+		cacheStatus = "HIT"
+	}
 	for _, cachedRange := range vr.CachedRanges() {
 		if cachedRange.Start < span.End && cachedRange.End > span.Start {
-			cacheStatus = "PARTIAL"
+			if cacheStatus != "HIT" {
+				cacheStatus = "PARTIAL"
+			}
 			break
 		}
 	}
@@ -429,6 +448,7 @@ func (h *Handler) cacheSourceAndOptions(r *http.Request, sourceURL string, remot
 		Logger:       h.logger,
 		ValidateSize: remote.Size,
 		IfRange:      remote.ETag,
+		OnRangeFetch: func() { h.metrics.originRangeFetches.Add(1) },
 	}
 	if src.IfRange == "" {
 		src.IfRange = formatHTTPTime(remote.LastModified)
@@ -441,6 +461,7 @@ func (h *Handler) cacheSourceAndOptions(r *http.Request, sourceURL string, remot
 		varc.WithAttr("etag", remote.ETag),
 		varc.WithAttr("last_modified", formatHTTPTime(remote.LastModified)),
 		varc.WithAttr("cache_control", remote.CacheControl),
+		varc.WithAttr("validated_at", time.Now().UTC().Format(time.RFC3339Nano)),
 	}
 	if !remote.LastModified.IsZero() {
 		opts = append(opts, varc.WithModTime(remote.LastModified))
@@ -455,7 +476,7 @@ func (h *Handler) tryServeCache(w http.ResponseWriter, r *http.Request, key, sou
 			return false, nil, nil
 		}
 		h.logger.Warn("varc cache-only open failed", zap.Error(err), zap.String("key", key))
-		return false, nil, nil
+		return false, nil, fmt.Errorf("varc cache open: %w", err)
 	}
 	defer vr.Close()
 
@@ -496,14 +517,11 @@ func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.R
 		status = http.StatusPartialContent
 	}
 	w.WriteHeader(status)
-	h.metrics.bytesServed.Add(span.Length())
 	switch cacheStatus {
 	case "HIT":
 		h.metrics.hits.Add(1)
-		h.metrics.bytesFromCache.Add(span.Length())
 	case "STALE":
 		h.metrics.staleHits.Add(1)
-		h.metrics.bytesFromCache.Add(span.Length())
 	default:
 		h.metrics.misses.Add(1)
 	}
@@ -515,6 +533,12 @@ func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.R
 	}
 	buf := make([]byte, defaultResponseBuffer)
 	written, err := io.CopyBuffer(w, io.LimitReader(vr, span.Length()), buf)
+	h.metrics.bytesServed.Add(written)
+	if cacheStatus == "HIT" || cacheStatus == "STALE" {
+		h.metrics.bytesFromCache.Add(written)
+	} else {
+		h.metrics.bytesFromOrigin.Add(written)
+	}
 	if err != nil {
 		if isClientDisconnect(r.Context(), err) {
 			return nil

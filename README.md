@@ -98,6 +98,7 @@ http.handlers.varc
             poll_interval 1m
 
             probe_timeout 15s
+            revalidate_interval 5m
             dial_timeout 10s
             response_header_timeout 30s
 
@@ -167,6 +168,8 @@ The HTTP origin must support single byte ranges.
 `varc` rejects malformed ranges, wrong totals, wrong content lengths, unexpected `200` responses, and truncated bodies.
 
 Streaming range bodies do not use a fixed total timeout. `timeout` is a read-idle timeout that resets whenever origin bytes arrive. Dial, TLS, probe, and response-header timeouts still apply.
+
+Cached objects are treated as immutable by default. Set `revalidate_interval` to periodically probe mutable origins and invalidate cached ranges when their ETag, modification time, or size changes. `stale_if_error` may serve the last successfully validated copy only for its configured duration.
 
 ## Authentication and private responses
 

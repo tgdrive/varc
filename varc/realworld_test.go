@@ -358,6 +358,140 @@ func TestTwoCacheInstancesSharingDirectoryRemainReadable(t *testing.T) {
 	}
 }
 
+func TestTwoCacheInstancesMergeDisjointRangeMetadata(t *testing.T) {
+	dir := t.TempDir()
+	opt := testOptions(dir)
+	opt.ChunkSize = 4096
+	opt.ChunkSizeLimit = 4096
+	src := newCountingSource(16 * 1024)
+	c1, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	r1, err := c1.Open(context.Background(), "shared-disjoint", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1.Close()
+	r2, err := c2.Open(context.Background(), "shared-disjoint", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i, read := range []struct {
+		r   *Reader
+		off int64
+	}{{r1, 0}, {r2, 8192}} {
+		_ = i
+		wg.Add(1)
+		go func(read struct {
+			r   *Reader
+			off int64
+		}) {
+			defer wg.Done()
+			_, err := read.r.ReadAt(make([]byte, 1), read.off)
+			errs <- err
+		}(read)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	meta, ok, err := loadMeta(c1.MetaPath("shared-disjoint"))
+	if err != nil || !ok {
+		t.Fatalf("load metadata: ok=%v err=%v", ok, err)
+	}
+	if !containsRange(meta.Ranges, 0, 4096) || !containsRange(meta.Ranges, 8192, 12288) {
+		t.Fatalf("disjoint ranges were not merged: %+v", meta.Ranges)
+	}
+}
+
+type cancellationIgnoringSource struct {
+	data    []byte
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *cancellationIgnoringSource) ReadAt(p []byte, off int64) (int, error) {
+	return bytes.NewReader(s.data).ReadAt(p, off)
+}
+
+func (s *cancellationIgnoringSource) OpenRange(context.Context, int64, int64) (io.ReadCloser, error) {
+	s.once.Do(func() { close(s.started) })
+	return io.NopCloser(&releaseReader{data: s.data, release: s.release}), nil
+}
+
+type releaseReader struct {
+	data    []byte
+	release <-chan struct{}
+	off     int
+}
+
+func (r *releaseReader) Read(p []byte) (int, error) {
+	<-r.release
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func TestCanceledGenerationCannotWriteIntoReplacement(t *testing.T) {
+	opt := testOptions(t.TempDir())
+	opt.ChunkSize = 64
+	opt.ChunkSizeLimit = 64
+	c, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	oldData := bytes.Repeat([]byte("o"), 64)
+	old := &cancellationIgnoringSource{data: oldData, started: make(chan struct{}), release: make(chan struct{})}
+	r1, err := c.Open(context.Background(), "generation", 64, old, WithFingerprint("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := r1.ReadAt(make([]byte, 1), 0)
+		readDone <- err
+	}()
+	<-old.started
+
+	newData := bytes.Repeat([]byte("n"), 64)
+	r2, err := c.Open(context.Background(), "generation", 64, bytes.NewReader(newData), WithFingerprint("new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+	close(old.release)
+	if err := <-readDone; err == nil {
+		t.Fatal("obsolete generation read unexpectedly succeeded")
+	}
+	got := make([]byte, len(newData))
+	if _, err := r2.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newData) {
+		t.Fatalf("replacement data was corrupted: %q", got)
+	}
+	_ = r1.Close()
+}
+
 func TestRepeatedCancellationLeavesNoQueuedTasks(t *testing.T) {
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = 64

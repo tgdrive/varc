@@ -196,7 +196,8 @@ func TestSlowRemoteRcloneChunkFacadeThreeStreams(t *testing.T) {
 	if _, err := r.ReadAtContext(ctx, make([]byte, 1), 0); err != nil {
 		t.Fatal(err)
 	}
-	waitForCoverageDeadline(t, c, "slow-rclone-parallel", fileSize, 10*time.Second)
+	// The race detector instruments the generated 384 MiB byte stream heavily.
+	waitForCoverageDeadline(t, c, "slow-rclone-parallel", fileSize, 30*time.Second)
 	assertRcloneFetches(t, src, fileSize, 1)
 }
 

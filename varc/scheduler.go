@@ -71,15 +71,16 @@ func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, en
 	}
 	taskCtx, cancel := context.WithCancel(c.ctx)
 	t := &downloadTask{
-		state:    st,
-		cache:    c,
-		src:      src,
-		start:    chunkStart,
-		end:      chunkEnd,
-		key:      key,
-		ctx:      taskCtx,
-		cancel:   cancel,
-		priority: priority,
+		state:      st,
+		cache:      c,
+		src:        src,
+		start:      chunkStart,
+		end:        chunkEnd,
+		key:        key,
+		ctx:        taskCtx,
+		cancel:     cancel,
+		priority:   priority,
+		generation: st.generation,
 	}
 	if owner != nil {
 		t.preloadOwners = map[*Reader]struct{}{owner: {}}
@@ -97,7 +98,7 @@ func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, en
 	}
 	c.schedulerCond.Broadcast()
 	c.schedulerMu.Unlock()
-	st.cond.Broadcast()
+	st.notifyLocked()
 	c.wg.Add(1)
 	go c.runDownloadTask(t)
 }
@@ -115,7 +116,7 @@ func (c *Cache) cancelReaderPreloadsLocked(st *entryState, owner *Reader) {
 	c.schedulerMu.Lock()
 	c.schedulerCond.Broadcast()
 	c.schedulerMu.Unlock()
-	st.cond.Broadcast()
+	st.notifyLocked()
 }
 
 func (c *Cache) runDownloadTask(t *downloadTask) {
@@ -348,7 +349,7 @@ func (c *Cache) consumeRangeStream(ctx context.Context, t *downloadTask, body io
 			checksum = crc32.ChecksumIEEE(buf)
 		}
 		t.state.mu.Lock()
-		if t.state.removed {
+		if t.state.removed || t.generation != t.state.generation {
 			t.state.mu.Unlock()
 			return offset, bufferSize, checksums, ErrClosed
 		}
@@ -361,7 +362,7 @@ func (c *Cache) consumeRangeStream(ctx context.Context, t *downloadTask, body io
 		}
 		t.state.volatile = addRange(t.state.volatile, offset, end)
 		if end < streamEnd || readErr != nil {
-			t.state.cond.Broadcast()
+			t.state.notifyLocked()
 		}
 		t.state.mu.Unlock()
 		offset = end
@@ -384,7 +385,7 @@ func (c *Cache) persistStreamProgress(t *downloadTask, start, end int64, checksu
 	}
 	t.state.mu.Lock()
 	defer t.state.mu.Unlock()
-	if t.state.removed {
+	if t.state.removed || t.generation != t.state.generation {
 		return ErrClosed
 	}
 	oldRanges := append([]byteRange(nil), t.state.meta.Ranges...)
@@ -398,10 +399,10 @@ func (c *Cache) persistStreamProgress(t *downloadTask, start, end int64, checksu
 		t.state.meta.Ranges = oldRanges
 		t.state.meta.Checksums = oldChecksums
 		t.state.volatile = subtractRange(t.state.volatile, start, end)
-		t.state.cond.Broadcast()
+		t.state.notifyLocked()
 		return err
 	}
 	t.state.volatile = subtractRange(t.state.volatile, start, end)
-	t.state.cond.Broadcast()
+	t.state.notifyLocked()
 	return nil
 }

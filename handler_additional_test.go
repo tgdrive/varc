@@ -311,6 +311,52 @@ func TestHandlerProbeSingleflightCollapsesConcurrentHEADs(t *testing.T) {
 	}
 }
 
+func TestHandlerProbeSingleflightSurvivesFirstCallerCancellation(t *testing.T) {
+	var heads atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "7")
+		if r.Method == http.MethodHead {
+			if heads.Add(1) == 1 {
+				close(started)
+			}
+			<-release
+		}
+	}))
+	defer origin.Close()
+	h := newUnitHandler(t, origin.URL)
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstReq := httptest.NewRequest(http.MethodGet, "https://edge.test/shared", nil).WithContext(firstCtx)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := h.probeRemoteSingleflight(firstCtx, firstReq, "shared", origin.URL+"/shared")
+		firstDone <- err
+	}()
+	<-started
+	secondReq := httptest.NewRequest(http.MethodGet, "https://edge.test/shared", nil)
+	secondDone := make(chan error, 1)
+	go func() {
+		remote, err := h.probeRemoteSingleflight(secondReq.Context(), secondReq, "shared", origin.URL+"/shared")
+		if err == nil && remote.Size != 7 {
+			err = fmt.Errorf("size=%d", remote.Size)
+		}
+		secondDone <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancelFirst()
+	close(release)
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first caller error=%v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("shared probe failed after leader cancellation: %v", err)
+	}
+	if heads.Load() != 1 {
+		t.Fatalf("HEAD requests=%d, want 1", heads.Load())
+	}
+}
+
 func TestHandlerRequestAndResponseBypassPolicies(t *testing.T) {
 	body := []byte("private payload")
 	originHeaders := http.Header{}
@@ -776,6 +822,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	forward_header X-Forward
 	timeout 5s
 	probe_timeout 4s
+	revalidate_interval 10s
 	dial_timeout 3s
 	tls_handshake_timeout 2s
 	response_header_timeout 6s
@@ -802,7 +849,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	if h.StaticHeaders.Get("X-Token") != "static" || len(h.ForwardHeaders) != 1 || h.MaxIdleConns != 42 || h.ChunkSize != 1024*1024 || h.PreloadChunks != 2 || h.CacheMaxSize != 5*1024*1024 || h.CacheMinFreeSpace != 6*1024*1024 || h.ShardLevel != 3 || h.ReadRetryCount != 2 {
 		t.Fatalf("numeric/header full parse failed: headers=%+v max_idle=%d chunk=%d max_size=%d", h.StaticHeaders, h.MaxIdleConns, h.ChunkSize, h.CacheMaxSize)
 	}
-	if time.Duration(h.Timeout) != 5*time.Second || time.Duration(h.ProbeTimeout) != 4*time.Second || time.Duration(h.ReadRetryDelay) != 11*time.Millisecond {
+	if time.Duration(h.Timeout) != 5*time.Second || time.Duration(h.ProbeTimeout) != 4*time.Second || time.Duration(h.RevalidateInterval) != 10*time.Second || time.Duration(h.ReadRetryDelay) != 11*time.Millisecond {
 		t.Fatalf("duration full parse failed timeout=%v probe=%v retry=%v", h.Timeout, h.ProbeTimeout, h.ReadRetryDelay)
 	}
 
@@ -822,7 +869,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 		t.Fatal("sanitizeMetricName failed")
 	}
 
-	v, err, shared := (*flightGroup)(nil).do(context.Background(), "k", func() (any, error) { return "ok", nil })
+	v, err, shared := (*flightGroup)(nil).do(context.Background(), "k", func(context.Context) (any, error) { return "ok", nil })
 	if err != nil || v != "ok" || shared {
 		t.Fatalf("nil flight do v=%v err=%v shared=%v", v, err, shared)
 	}
@@ -830,7 +877,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	go func() {
-		_, _, _ = g.do(context.Background(), "k", func() (any, error) {
+		_, _, _ = g.do(context.Background(), "k", func(context.Context) (any, error) {
 			close(started)
 			<-release
 			return "late", nil
@@ -839,7 +886,7 @@ func TestCaddyfileHelperParsersAndLoggerAndFlightGroupEdges(t *testing.T) {
 	<-started
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err, shared := g.do(ctx, "k", func() (any, error) { return "never", nil }); !shared || !errors.Is(err, context.Canceled) {
+	if _, err, shared := g.do(ctx, "k", func(context.Context) (any, error) { return "never", nil }); !shared || !errors.Is(err, context.Canceled) {
 		t.Fatalf("flight canceled shared=%v err=%v", shared, err)
 	}
 	close(release)

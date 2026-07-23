@@ -47,6 +47,7 @@ type HTTPRangeSource struct {
 	Logger       *zap.Logger
 	ValidateSize int64
 	IfRange      string
+	OnRangeFetch func()
 }
 
 // OpenRange opens one inclusive byte range as a stream.
@@ -73,6 +74,9 @@ func (s *HTTPRangeSource) OpenRange(ctx context.Context, start, end int64) (io.R
 	client := s.Client
 	if client == nil {
 		client = http.DefaultClient
+	}
+	if s.OnRangeFetch != nil {
+		s.OnRangeFetch()
 	}
 	resp, err := client.Do(req)
 	if err != nil {

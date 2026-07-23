@@ -82,7 +82,11 @@ func (h *Handler) writePrometheusMetrics(w http.ResponseWriter) error {
 				name = field.Name
 			}
 			metric := "varc_core_" + sanitizeMetricName(name)
-			fmt.Fprintf(w, "# TYPE %s gauge\n%s %v\n", metric, metric, v.Field(i).Interface())
+			metricType := "counter"
+			if name == "inflight_bytes" || name == "open_tracked_entries" {
+				metricType = "gauge"
+			}
+			fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", metric, metricType, metric, v.Field(i).Interface())
 		}
 	}
 	return nil

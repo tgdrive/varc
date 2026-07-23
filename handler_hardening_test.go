@@ -3,6 +3,7 @@ package varc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -111,6 +112,81 @@ func TestHandlerStaleIfError(t *testing.T) {
 	}
 	if !bytes.Equal(second.Body.Bytes(), body) {
 		t.Fatal("stale body mismatch")
+	}
+}
+
+func TestHandlerRevalidatesAndReplacesChangedObject(t *testing.T) {
+	oldBody := []byte(strings.Repeat("old-data", 16))
+	newBody := []byte(strings.Repeat("new-data", 16))
+	var version atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := oldBody
+		etag := `"old"`
+		if version.Load() > 0 {
+			body = newBody
+			etag = `"new"`
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		w.Header().Set("ETag", etag)
+		if r.Method == http.MethodHead {
+			return
+		}
+		span, err := parseSingleRange(r.Header.Get("Range"), int64(len(body)))
+		if err != nil {
+			writeRangeNotSatisfiable(w, int64(len(body)))
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(span.Length()))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", span.Start, span.End-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[span.Start:span.End])
+	}))
+	defer origin.Close()
+	h := newUnitHandler(t, origin.URL)
+	h.RevalidateInterval = caddyDuration(time.Nanosecond)
+
+	request := func() []byte {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "https://edge.test/mutable.bin", nil)
+		if err := h.ServeHTTP(rr, req, failNext(t)); err != nil {
+			t.Fatal(err)
+		}
+		return rr.Body.Bytes()
+	}
+	if got := request(); !bytes.Equal(got, oldBody) {
+		t.Fatalf("initial body mismatch: %q", got)
+	}
+	version.Store(1)
+	if got := request(); !bytes.Equal(got, newBody) {
+		t.Fatalf("revalidated body mismatch: %q", got)
+	}
+}
+
+func TestHandlerBypassHonorsReadIdleTimeout(t *testing.T) {
+	canceled := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "2")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer origin.Close()
+	h := newUnitHandler(t, origin.URL)
+	h.Timeout = caddyDuration(20 * time.Millisecond)
+	req := httptest.NewRequest(http.MethodGet, "https://edge.test/private.bin", nil)
+	req.Header.Set("Authorization", "Bearer private")
+	err := h.ServeHTTP(httptest.NewRecorder(), req, failNext(t))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bypass error=%v, want deadline exceeded", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("origin request was not canceled after idle timeout")
 	}
 }
 

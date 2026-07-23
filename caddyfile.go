@@ -179,6 +179,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.StaleIfError = caddy.Duration(dur)
+			case "revalidate_interval":
+				dur, err := nextDuration(d)
+				if err != nil {
+					return err
+				}
+				h.RevalidateInterval = caddy.Duration(dur)
 			case "cache_only":
 				v, err := nextBool(d)
 				if err != nil {

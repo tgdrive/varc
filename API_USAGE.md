@@ -764,6 +764,7 @@ The Caddy handler now includes production-facing controls around the core range 
 - `Authorization` bypasses by default. Enable `cache_authorization on` only when the key includes the authorization scope or the bytes are identical for every user.
 - `Set-Cookie`, `Cache-Control: private`, and `Cache-Control: no-store` bypass by default. Enable `cache_set_cookie`, `cache_private`, or `cache_no_store` only for trusted origins.
 - `stale_if_error` serves an already-cached requested range when origin probing/opening fails.
+- `revalidate_interval` periodically probes cached objects before serving them. It is disabled by default for immutable or content-addressed objects.
 - The admin endpoint supports status, Prometheus metrics, object plans, prune, purge, pin, unpin, repair, and warm.
 
 Admin examples:

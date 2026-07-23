@@ -29,6 +29,7 @@
 
             timeout 60s
             probe_timeout 15s
+            revalidate_interval 5m
             dial_timeout 10s
             response_header_timeout 30s
             max_idle_conns 256
