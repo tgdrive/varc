@@ -309,12 +309,11 @@ type Cache struct {
 	verifyChecksum    bool
 	touchInterval     time.Duration
 
-	schedulerMu    sync.Mutex
-	schedulerCond  *sync.Cond
-	waitingTasks   []*downloadTask
-	activeDownload bool
-	activeTask     *downloadTask
-	nextTaskSeq    uint64
+	schedulerMu   sync.Mutex
+	schedulerCond *sync.Cond
+	waitingTasks  []*downloadTask
+	activeTasks   map[*entryState]*downloadTask
+	nextTaskSeq   uint64
 
 	mu     sync.Mutex
 	states map[string]*entryState
@@ -562,6 +561,7 @@ func New(ctx context.Context, opt Options) (*Cache, error) {
 		verifyChecksum:    merged.VerifyChecksum,
 		touchInterval:     merged.TouchInterval,
 		states:            make(map[string]*entryState),
+		activeTasks:       make(map[*entryState]*downloadTask),
 	}
 	c.schedulerCond = sync.NewCond(&c.schedulerMu)
 	if merged.CleanOnStart {

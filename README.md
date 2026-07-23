@@ -15,7 +15,7 @@ Cached ranges are served from disk. Missing ranges are fetched from the source a
 - Readers can consume bytes while a chunk is still downloading.
 - Concurrent readers share the same active download.
 - Blocking reads and seeks run before queued preload work.
-- Only one source transfer is active at a time.
+- Only one source transfer is active per cached object; independent objects download concurrently.
 - Closing the final reader cancels unused active and queued work.
 - Interrupted downloads keep committed bytes and resume from the first missing offset.
 

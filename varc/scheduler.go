@@ -90,7 +90,7 @@ func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, en
 	c.nextTaskSeq++
 	c.waitingTasks = append(c.waitingTasks, t)
 	if priority == priorityBlocking {
-		active := c.activeTask
+		active := c.activeTasks[st]
 		if active != nil && active.priority != priorityBlocking {
 			active.cancel()
 		}
@@ -153,11 +153,10 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 			c.removeWaitingTaskLocked(t)
 			return ErrClosed
 		}
-		best := c.bestWaitingTaskLocked()
-		if !c.activeDownload && best == t {
+		best := c.bestRunnableTaskLocked()
+		if best == t {
 			c.removeWaitingTaskLocked(t)
-			c.activeDownload = true
-			c.activeTask = t
+			c.activeTasks[t.state] = t
 			t.started = true
 			return nil
 		}
@@ -167,9 +166,8 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 
 func (c *Cache) releaseTask(t *downloadTask) {
 	c.schedulerMu.Lock()
-	if c.activeTask == t {
-		c.activeTask = nil
-		c.activeDownload = false
+	if c.activeTasks[t.state] == t {
+		delete(c.activeTasks, t.state)
 	}
 	c.schedulerCond.Broadcast()
 	c.schedulerMu.Unlock()
@@ -184,9 +182,12 @@ func (c *Cache) promoteTask(t *downloadTask, priority taskPriority) {
 	c.schedulerMu.Unlock()
 }
 
-func (c *Cache) bestWaitingTaskLocked() *downloadTask {
+func (c *Cache) bestRunnableTaskLocked() *downloadTask {
 	var best *downloadTask
 	for _, task := range c.waitingTasks {
+		if c.activeTasks[task.state] != nil {
+			continue
+		}
 		if best == nil || task.priority < best.priority || (task.priority == best.priority && task.sequence < best.sequence) {
 			best = task
 		}

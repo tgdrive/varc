@@ -89,9 +89,78 @@ func TestStalledSourceCancellationDrainsScheduler(t *testing.T) {
 	}
 	c.schedulerMu.Lock()
 	defer c.schedulerMu.Unlock()
-	if c.activeDownload || len(c.waitingTasks) != 0 {
-		t.Fatalf("scheduler leaked active=%v queued=%d", c.activeDownload, len(c.waitingTasks))
+	if len(c.activeTasks) != 0 || len(c.waitingTasks) != 0 {
+		t.Fatalf("scheduler leaked active=%d queued=%d", len(c.activeTasks), len(c.waitingTasks))
 	}
+}
+
+func TestIndependentEntriesDownloadConcurrently(t *testing.T) {
+	opt := testOptions(t.TempDir())
+	opt.ChunkSize = 64
+	opt.ChunkSizeLimit = 64
+	opt.PreloadChunks = 0
+	c, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	newSource := func(value byte) *gatedRangeSource {
+		return &gatedRangeSource{data: bytes.Repeat([]byte{value}, 32), started: started, release: release}
+	}
+	r1, err := c.Open(context.Background(), "concurrent-entry-1", 32, newSource(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1.Close()
+	r2, err := c.Open(context.Background(), "concurrent-entry-2", 32, newSource(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+
+	errs := make(chan error, 2)
+	for _, r := range []*Reader{r1, r2} {
+		go func() {
+			_, readErr := r.ReadAt(make([]byte, 1), 0)
+			errs <- readErr
+		}()
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("independent cache entries were downloaded serially")
+		}
+	}
+	close(release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+type gatedRangeSource struct {
+	data    []byte
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (s *gatedRangeSource) ReadAt(p []byte, off int64) (int, error) {
+	return bytes.NewReader(s.data).ReadAt(p, off)
+}
+
+func (s *gatedRangeSource) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
+	s.started <- struct{}{}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return io.NopCloser(bytes.NewReader(s.data[start : end+1])), nil
 }
 
 func TestRestartUsesDurableSparseCacheWithoutSource(t *testing.T) {
@@ -322,7 +391,7 @@ func TestRepeatedCancellationLeavesNoQueuedTasks(t *testing.T) {
 	}
 	c.schedulerMu.Lock()
 	defer c.schedulerMu.Unlock()
-	if c.activeDownload || len(c.waitingTasks) != 0 {
-		t.Fatalf("scheduler retained active=%v queued=%d", c.activeDownload, len(c.waitingTasks))
+	if len(c.activeTasks) != 0 || len(c.waitingTasks) != 0 {
+		t.Fatalf("scheduler retained active=%d queued=%d", len(c.activeTasks), len(c.waitingTasks))
 	}
 }
