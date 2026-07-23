@@ -13,7 +13,7 @@
 //   - persistent sparse range metadata
 //   - atomic metadata updates
 //   - duplicate download coalescing
-//   - bounded concurrent fetches
+//   - concurrent fetches across independent entries
 //   - optional read-ahead
 //   - cache-only reads
 //   - fingerprint/modtime invalidation
@@ -285,7 +285,6 @@ type Cache struct {
 	chunkSize         int64
 	chunkSizeLimit    int64
 	preloadChunks     int
-	maxInflightBytes  int64
 	cacheMaxAge       time.Duration
 	cacheMaxSize      int64
 	cacheMinFreeSpace int64
@@ -542,7 +541,6 @@ func New(ctx context.Context, opt Options) (*Cache, error) {
 		chunkSize:         merged.ChunkSize,
 		chunkSizeLimit:    merged.ChunkSizeLimit,
 		preloadChunks:     merged.PreloadChunks,
-		maxInflightBytes:  merged.ChunkSizeLimit,
 		cacheMaxAge:       merged.CacheMaxAge,
 		cacheMaxSize:      merged.CacheMaxSize,
 		cacheMinFreeSpace: merged.CacheMinFreeSpace,

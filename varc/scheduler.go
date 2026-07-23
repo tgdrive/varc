@@ -153,10 +153,12 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 	for {
 		if err := t.ctx.Err(); err != nil {
 			c.removeWaitingTaskLocked(t)
+			c.schedulerCond.Broadcast()
 			return err
 		}
 		if c.ctx.Err() != nil {
 			c.removeWaitingTaskLocked(t)
+			c.schedulerCond.Broadcast()
 			return ErrClosed
 		}
 		best := c.bestRunnableTaskLocked()
@@ -164,6 +166,7 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 			c.removeWaitingTaskLocked(t)
 			c.activeTasks[t.state] = t
 			t.started = true
+			c.schedulerCond.Broadcast()
 			return nil
 		}
 		c.schedulerCond.Wait()
@@ -215,10 +218,8 @@ func (c *Cache) downloadStreamChunk(t *downloadTask, src RangeSource, chunkStart
 	bufferSize := int64(initialWriteBufferSize)
 	var checksums []blockChecksum
 	for attempt := 0; ; attempt++ {
-		reserved := chunkEnd - offset
-		if err := c.reserveInflight(t.ctx, reserved); err != nil {
-			return err
-		}
+		inflight := chunkEnd - offset
+		c.inflightByte.Add(inflight)
 
 		attemptCtx, cancelAttempt := context.WithCancel(t.ctx)
 		progress := make(chan struct{}, 1)
@@ -259,7 +260,7 @@ func (c *Cache) downloadStreamChunk(t *downloadTask, src RangeSource, chunkStart
 			err = fmt.Errorf("varc: source read idle for %s: %w", c.readIdleTimeout, context.DeadlineExceeded)
 		default:
 		}
-		c.releaseInflight(reserved)
+		c.inflightByte.Add(-inflight)
 		if err == nil {
 			return c.persistStreamProgress(t, chunkStart, offset, checksums)
 		}

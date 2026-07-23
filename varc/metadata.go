@@ -64,35 +64,6 @@ func subtractRange(ranges []byteRange, start, end int64) []byteRange {
 	return out
 }
 
-func (c *Cache) reserveInflight(ctx context.Context, n int64) error {
-	if c.maxInflightBytes <= 0 || n <= 0 {
-		return nil
-	}
-	for {
-		cur := c.inflightByte.Load()
-		if cur+n <= c.maxInflightBytes || cur == 0 {
-			if c.inflightByte.CompareAndSwap(cur, cur+n) {
-				return nil
-			}
-			continue
-		}
-		select {
-		case <-time.After(10 * time.Millisecond):
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.ctx.Done():
-			return ErrClosed
-		}
-	}
-}
-
-func (c *Cache) releaseInflight(n int64) {
-	if c.maxInflightBytes <= 0 || n <= 0 {
-		return
-	}
-	c.inflightByte.Add(-n)
-}
-
 // writeTaskCacheBlockLocked writes a progressive cache segment. The caller
 // holds t.state.mu, which serializes concurrent chunk streams on the shared
 // task-owned descriptor.

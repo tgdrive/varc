@@ -96,8 +96,8 @@ func TestStalledSourceCancellationDrainsScheduler(t *testing.T) {
 
 func TestIndependentEntriesDownloadConcurrently(t *testing.T) {
 	opt := testOptions(t.TempDir())
-	opt.ChunkSize = 64
-	opt.ChunkSizeLimit = 64
+	opt.ChunkSize = 2 * maxWriteBufferSize
+	opt.ChunkSizeLimit = 2 * maxWriteBufferSize
 	opt.PreloadChunks = 0
 	c, err := New(context.Background(), opt)
 	if err != nil {
@@ -105,38 +105,39 @@ func TestIndependentEntriesDownloadConcurrently(t *testing.T) {
 	}
 	defer c.Close()
 
-	started := make(chan struct{}, 2)
+	const concurrency = 8
+	started := make(chan struct{}, concurrency)
 	release := make(chan struct{})
 	newSource := func(value byte) *gatedRangeSource {
-		return &gatedRangeSource{data: bytes.Repeat([]byte{value}, 32), started: started, release: release}
+		return &gatedRangeSource{data: bytes.Repeat([]byte{value}, 2*int(maxWriteBufferSize)), started: started, release: release}
 	}
-	r1, err := c.Open(context.Background(), "concurrent-entry-1", 32, newSource(1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r1.Close()
-	r2, err := c.Open(context.Background(), "concurrent-entry-2", 32, newSource(2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r2.Close()
 
-	errs := make(chan error, 2)
-	for _, r := range []*Reader{r1, r2} {
+	readers := make([]*Reader, 0, concurrency)
+	for i := range concurrency {
+		r, err := c.Open(context.Background(), fmt.Sprintf("concurrent-entry-%d", i), 2*maxWriteBufferSize, newSource(byte(i+1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		readers = append(readers, r)
+		defer r.Close()
+	}
+
+	errs := make(chan error, concurrency)
+	for _, r := range readers {
 		go func() {
 			_, readErr := r.ReadAt(make([]byte, 1), 0)
 			errs <- readErr
 		}()
 	}
-	for range 2 {
+	for range concurrency {
 		select {
 		case <-started:
 		case <-time.After(time.Second):
-			t.Fatal("independent cache entries were downloaded serially")
+			t.Fatal("independent cache entries did not all start concurrently")
 		}
 	}
 	close(release)
-	for range 2 {
+	for range concurrency {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -135,6 +136,100 @@ func TestServeReaderStreamsFirstBytesBeforeChunkCompletes(t *testing.T) {
 	defer w.mu.Unlock()
 	if !bytes.Equal(w.body.Bytes(), data) {
 		t.Fatalf("response bytes=%d, want %d", w.body.Len(), len(data))
+	}
+}
+
+func TestServeHTTPTwoColdStreamsFetchConcurrently(t *testing.T) {
+	const objectSize int64 = 2 << 20
+	data := bytes.Repeat([]byte{0x6d}, int(objectSize))
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFetches := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseFetches()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("ETag", fmt.Sprintf("%q", r.URL.Path))
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprint(objectSize))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		span, err := parseSingleRange(r.Header.Get("Range"), objectSize)
+		if err != nil {
+			writeRangeNotSatisfiable(w, objectSize)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(span.Length()))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", span.Start, span.End-1, objectSize))
+		w.WriteHeader(http.StatusPartialContent)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		started <- r.URL.Path
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = w.Write(data[span.Start:span.End])
+	}))
+	defer origin.Close()
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	h := &Handler{
+		Upstream:       origin.URL,
+		CacheDir:       t.TempDir(),
+		ChunkSize:      objectSize,
+		ChunkSizeLimit: objectSize,
+		Timeout:        caddy.Duration(5 * time.Second),
+		ProbeTimeout:   caddy.Duration(time.Second),
+	}
+	if err := h.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer h.Cleanup()
+
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		return errors.New("next handler should not be called")
+	})
+	done := make(chan error, 2)
+	for _, path := range []string{"/video/one.mp4", "/video/two.mp4"} {
+		req := httptest.NewRequest(http.MethodGet, "http://example.test"+path, nil)
+		req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", objectSize-1))
+		w := httptest.NewRecorder()
+		go func() {
+			done <- h.ServeHTTP(w, req, next)
+		}()
+	}
+
+	seen := make(map[string]bool, 2)
+	for range 2 {
+		select {
+		case path := <-started:
+			seen[path] = true
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of 2 cold video streams reached the origin", len(seen))
+		}
+	}
+	if !seen["/video/one.mp4"] || !seen["/video/two.mp4"] {
+		t.Fatalf("origin starts=%v, want both video paths", seen)
+	}
+
+	releaseFetches()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent HTTP streams did not finish")
+		}
 	}
 }
 

@@ -12,7 +12,7 @@ The cache stores fetched byte ranges in a sparse local data file and writes a `.
 - Cache-only/offline reads
 - Fingerprint and size-based invalidation
 - Duplicate download coalescing across readers
-- Bounded concurrent source reads
+- Concurrent source reads across independent cache entries
 - Optional read-ahead
 - Optional CRC32 block verification
 - Background and manual pruning
@@ -556,7 +556,7 @@ Tuning notes:
 |---|---|
 | `ChunkSize` | 16–128 MiB for media/range workloads. Each chunk is one backend range request. |
 | `ChunkSizeLimit` | Sequential chunks double up to this limit. Negative allows unlimited growth; set it equal to `ChunkSize` for fixed-size requests. |
-| `PreloadChunks` | Number of future adaptive chunks to schedule. Concurrency and in-flight bytes are derived internally. |
+| `PreloadChunks` | Number of future adaptive chunks to schedule for each reader. |
 | `SyncWrites` | Enable only when crash consistency is more important than throughput. |
 | `VerifyChecksum` | Enable for paranoid local-disk verification, not for maximum throughput. |
 | `ShardLevel` | Use `2` for long-running caches with many objects. |
@@ -597,9 +597,9 @@ Common errors:
 
 - Multiple readers can open the same key.
 - Concurrent reads for overlapping missing ranges are coalesced.
-- A global semaphore limits active download tasks.
-- One origin download is active at a time; blocking reads and seeks outrank queued preloads.
-- The in-flight byte budget is capped by `ChunkSizeLimit`.
+- Each cache entry runs at most one origin task, while independent entries download concurrently.
+- Blocking reads and seeks outrank queued preloads.
+- There is no global source-fetch limit; every independent entry may download concurrently.
 - `Reader` methods are safe for ordinary concurrent use, but for high-throughput code prefer one reader per request/stream.
 - `Close` cancels active downloads owned by that reader.
 - `Cache.Close` cancels background work and active cache operations.
