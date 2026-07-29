@@ -83,12 +83,7 @@ func (r *Reader) readAtContextLockedMode(ctx context.Context, p []byte, off int6
 	if err != nil {
 		return 0, err
 	}
-	f, err := os.Open(r.path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	n, readErr := readFullAt(f, p[:readEnd-off], off)
+	n, readErr := r.readCacheFile(p[:readEnd-off], off)
 	r.cache.metricReads.Add(1)
 	r.cache.metricReadBytes.Add(int64(n))
 	r.cache.metricHits.Add(1)
@@ -107,6 +102,30 @@ func (r *Reader) readAtContextLockedMode(ctx context.Context, p []byte, off int6
 		return n, io.EOF
 	}
 	return n, readErr
+}
+
+func (r *Reader) readCacheFile(p []byte, off int64) (int, error) {
+	r.fileMu.RLock()
+	if r.file != nil {
+		n, err := readFullAt(r.file, p, off)
+		r.fileMu.RUnlock()
+		return n, err
+	}
+	r.fileMu.RUnlock()
+
+	r.fileMu.Lock()
+	defer r.fileMu.Unlock()
+	if r.closed.Load() {
+		return 0, ErrClosed
+	}
+	if r.file == nil {
+		f, err := os.Open(r.path)
+		if err != nil {
+			return 0, err
+		}
+		r.file = f
+	}
+	return readFullAt(r.file, p, off)
 }
 
 func (r *Reader) currentMeta() cacheMeta {
@@ -178,6 +197,12 @@ func (r *Reader) Close() error {
 	r.closeOnce.Do(func() {
 		r.closed.Store(true)
 		r.cancel()
+		r.fileMu.Lock()
+		if r.file != nil {
+			_ = r.file.Close()
+			r.file = nil
+		}
+		r.fileMu.Unlock()
 		st := r.state
 		st.mu.Lock()
 		if st.readers > 0 {

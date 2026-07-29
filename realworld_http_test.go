@@ -38,7 +38,7 @@ func TestHTTPRangeTransientUnauthorizedRetries(t *testing.T) {
 	opt.CacheDir = t.TempDir()
 	opt.ChunkSize = int64(len(data))
 	opt.ChunkSizeLimit = opt.ChunkSize
-	opt.PreloadChunks = 0
+	opt.PreloadChunks = -1
 	opt.NoBackground = true
 	opt.ReadRetryCount = 1
 	opt.ReadRetryDelay = time.Millisecond

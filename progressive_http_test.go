@@ -81,7 +81,7 @@ func TestServeReaderStreamsFirstBytesBeforeChunkCompletes(t *testing.T) {
 	opt.CacheDir = t.TempDir()
 	opt.ChunkSize = int64(len(data))
 	opt.ChunkSizeLimit = opt.ChunkSize
-	opt.PreloadChunks = 0
+	opt.PreloadChunks = -1
 	opt.NoBackground = true
 	cache, err := corevarc.New(context.Background(), opt)
 	if err != nil {
@@ -169,13 +169,20 @@ func TestServeHTTPTwoColdStreamsFetchConcurrently(t *testing.T) {
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
+		prefixEnd := minInt64(span.Start+4096, span.End)
+		if _, err := w.Write(data[span.Start:prefixEnd]); err != nil {
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 		started <- r.URL.Path
 		select {
 		case <-release:
 		case <-r.Context().Done():
 			return
 		}
-		_, _ = w.Write(data[span.Start:span.End])
+		_, _ = w.Write(data[prefixEnd:span.End])
 	}))
 	defer origin.Close()
 
@@ -198,10 +205,12 @@ func TestServeHTTPTwoColdStreamsFetchConcurrently(t *testing.T) {
 		return errors.New("next handler should not be called")
 	})
 	done := make(chan error, 2)
+	writers := make([]*firstWriteRecorder, 0, 2)
 	for _, path := range []string{"/video/one.mp4", "/video/two.mp4"} {
 		req := httptest.NewRequest(http.MethodGet, "http://example.test"+path, nil)
 		req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", objectSize-1))
-		w := httptest.NewRecorder()
+		w := &firstWriteRecorder{header: make(http.Header), firstWrite: make(chan struct{})}
+		writers = append(writers, w)
 		go func() {
 			done <- h.ServeHTTP(w, req, next)
 		}()
@@ -218,6 +227,13 @@ func TestServeHTTPTwoColdStreamsFetchConcurrently(t *testing.T) {
 	}
 	if !seen["/video/one.mp4"] || !seen["/video/two.mp4"] {
 		t.Fatalf("origin starts=%v, want both video paths", seen)
+	}
+	for i, w := range writers {
+		select {
+		case <-w.firstWrite:
+		case <-time.After(time.Second):
+			t.Fatalf("stream %d did not write its first response bytes while both origins were active", i+1)
+		}
 	}
 
 	releaseFetches()
@@ -302,7 +318,7 @@ func TestServeReaderRejectsShortCachedBody(t *testing.T) {
 	opt.CacheDir = t.TempDir()
 	opt.ChunkSize = int64(len(data))
 	opt.ChunkSizeLimit = opt.ChunkSize
-	opt.PreloadChunks = 0
+	opt.PreloadChunks = -1
 	opt.NoBackground = true
 	cache, err := corevarc.New(context.Background(), opt)
 	if err != nil {

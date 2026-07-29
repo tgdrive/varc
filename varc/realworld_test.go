@@ -98,7 +98,7 @@ func TestIndependentEntriesDownloadConcurrently(t *testing.T) {
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = 2 * maxWriteBufferSize
 	opt.ChunkSizeLimit = 2 * maxWriteBufferSize
-	opt.PreloadChunks = 0
+	opt.PreloadChunks = -1
 	c, err := New(context.Background(), opt)
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +138,61 @@ func TestIndependentEntriesDownloadConcurrently(t *testing.T) {
 	}
 	close(release)
 	for range concurrency {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSameEntryBlockingRangesDownloadConcurrently(t *testing.T) {
+	opt := testOptions(t.TempDir())
+	opt.ChunkSize = maxWriteBufferSize
+	opt.ChunkSizeLimit = maxWriteBufferSize
+	opt.PreloadChunks = -1
+	c, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	src := &gatedRangeSource{
+		data:    bytes.Repeat([]byte{0x7a}, 2*int(maxWriteBufferSize)),
+		started: started,
+		release: release,
+	}
+
+	r1, err := c.Open(context.Background(), "shared-entry", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1.Close()
+	r2, err := c.Open(context.Background(), "shared-entry", int64(len(src.data)), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+
+	errs := make(chan error, 2)
+	go func() {
+		_, readErr := r1.ReadAt(make([]byte, 1), 0)
+		errs <- readErr
+	}()
+	go func() {
+		_, readErr := r2.ReadAt(make([]byte, 1), maxWriteBufferSize)
+		errs <- readErr
+	}()
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("same-entry blocking ranges did not start concurrently")
+		}
+	}
+	close(release)
+	for range 2 {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}

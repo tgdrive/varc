@@ -208,6 +208,45 @@ func TestStreamTaskKeepsOneCacheFileOpen(t *testing.T) {
 	}
 }
 
+func TestReaderReusesCacheFileUntilClose(t *testing.T) {
+	c := streamTestCache(t, 0)
+	src := bytes.NewReader(bytes.Repeat([]byte{0x39}, 2*int(maxWriteBufferSize)))
+	r, err := c.Open(context.Background(), "reader-file", src.Size(), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadAt(make([]byte, 1), 0); err != nil {
+		t.Fatal(err)
+	}
+	r.fileMu.RLock()
+	first := r.file
+	r.fileMu.RUnlock()
+	if first == nil {
+		t.Fatal("reader did not retain its cache file descriptor")
+	}
+	if _, err := r.ReadAt(make([]byte, 1), 1); err != nil {
+		t.Fatal(err)
+	}
+	r.fileMu.RLock()
+	second := r.file
+	r.fileMu.RUnlock()
+	if second != first {
+		t.Fatal("reader reopened its cache file between reads")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r.fileMu.RLock()
+	closed := r.file == nil
+	r.fileMu.RUnlock()
+	if !closed {
+		t.Fatal("reader retained its cache file after close")
+	}
+	if _, err := first.Stat(); err == nil {
+		t.Fatal("reader close left its cache file descriptor usable")
+	}
+}
+
 func TestInterruptedStreamDoesNotPersistPartialChunk(t *testing.T) {
 	c := streamTestCache(t, 0)
 	src := &controlledRangeSource{

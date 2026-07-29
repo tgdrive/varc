@@ -183,7 +183,7 @@ func TestCanceledReaderDoesNotPoisonReplacementReader(t *testing.T) {
 	opt := testOptions(t.TempDir())
 	opt.ChunkSize = int64(len(data))
 	opt.ChunkSizeLimit = opt.ChunkSize
-	opt.PreloadChunks = 0
+	opt.PreloadChunks = -1
 	c, err := New(context.Background(), opt)
 	if err != nil {
 		t.Fatal(err)

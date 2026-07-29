@@ -556,7 +556,7 @@ Tuning notes:
 |---|---|
 | `ChunkSize` | 16–128 MiB for media/range workloads. Each chunk is one backend range request. |
 | `ChunkSizeLimit` | Sequential chunks double up to this limit. Negative allows unlimited growth; set it equal to `ChunkSize` for fixed-size requests. |
-| `PreloadChunks` | Number of future adaptive chunks to schedule for each reader. |
+| `PreloadChunks` | Number of future adaptive chunks to schedule for each reader. Set it negative to disable preloading. |
 | `SyncWrites` | Enable only when crash consistency is more important than throughput. |
 | `VerifyChecksum` | Enable for paranoid local-disk verification, not for maximum throughput. |
 | `ShardLevel` | Use `2` for long-running caches with many objects. |

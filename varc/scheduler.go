@@ -96,9 +96,10 @@ func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, en
 	c.nextTaskSeq++
 	c.waitingTasks = append(c.waitingTasks, t)
 	if priority == priorityBlocking {
-		active := c.activeTasks[st]
-		if active != nil && active.priority != priorityBlocking {
-			active.cancel()
+		for active := range c.activeTasks[st] {
+			if active.priority != priorityBlocking {
+				active.cancel()
+			}
 		}
 	}
 	c.schedulerCond.Broadcast()
@@ -164,7 +165,12 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 		best := c.bestRunnableTaskLocked()
 		if best == t {
 			c.removeWaitingTaskLocked(t)
-			c.activeTasks[t.state] = t
+			active := c.activeTasks[t.state]
+			if active == nil {
+				active = make(map[*downloadTask]struct{})
+				c.activeTasks[t.state] = active
+			}
+			active[t] = struct{}{}
 			t.started = true
 			c.schedulerCond.Broadcast()
 			return nil
@@ -175,8 +181,11 @@ func (c *Cache) acquireTask(t *downloadTask) error {
 
 func (c *Cache) releaseTask(t *downloadTask) {
 	c.schedulerMu.Lock()
-	if c.activeTasks[t.state] == t {
-		delete(c.activeTasks, t.state)
+	if active := c.activeTasks[t.state]; active != nil {
+		delete(active, t)
+		if len(active) == 0 {
+			delete(c.activeTasks, t.state)
+		}
 	}
 	c.schedulerCond.Broadcast()
 	c.schedulerMu.Unlock()
@@ -194,8 +203,21 @@ func (c *Cache) promoteTask(t *downloadTask, priority taskPriority) {
 func (c *Cache) bestRunnableTaskLocked() *downloadTask {
 	var best *downloadTask
 	for _, task := range c.waitingTasks {
-		if c.activeTasks[task.state] != nil {
+		active := c.activeTasks[task.state]
+		if len(active) > 0 && task.priority != priorityBlocking {
 			continue
+		}
+		if task.priority == priorityBlocking {
+			blocked := false
+			for running := range active {
+				if running.priority != priorityBlocking {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
 		}
 		if best == nil || task.priority < best.priority || (task.priority == best.priority && task.sequence < best.sequence) {
 			best = task

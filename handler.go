@@ -239,7 +239,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ChunkSizeLimit != 0 {
 		opt.ChunkSizeLimit = h.ChunkSizeLimit
 	}
-	if h.PreloadChunks > 0 {
+	if h.PreloadChunks != 0 {
 		opt.PreloadChunks = h.PreloadChunks
 	}
 	if h.CacheMaxAge != 0 {
@@ -532,7 +532,9 @@ func (h *Handler) serveReader(w http.ResponseWriter, r *http.Request, vr *varc.R
 		return fmt.Errorf("varc seek: %w", err)
 	}
 	buf := make([]byte, defaultResponseBuffer)
-	written, err := io.CopyBuffer(w, io.LimitReader(vr, span.Length()), buf)
+	// Hide ResponseWriter.ReadFrom so io.CopyBuffer uses the configured buffer
+	// instead of net/http's smaller internal copy buffer.
+	written, err := io.CopyBuffer(struct{ io.Writer }{w}, io.LimitReader(vr, span.Length()), buf)
 	h.metrics.bytesServed.Add(written)
 	if cacheStatus == "HIT" || cacheStatus == "STALE" {
 		h.metrics.bytesFromCache.Add(written)

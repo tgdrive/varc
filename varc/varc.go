@@ -177,7 +177,8 @@ type Options struct {
 	ChunkSizeLimit int64
 
 	// PreloadChunks is the number of adaptive chunks prepared after the active
-	// read window. One is a balanced media-streaming default.
+	// read window. One is a balanced media-streaming default. Use a negative
+	// value to disable preloading when overriding DefaultOptions.
 	PreloadChunks int
 
 	// CacheMaxAge evicts entries whose AccessedAt is older than this duration
@@ -305,7 +306,7 @@ type Cache struct {
 	schedulerMu   sync.Mutex
 	schedulerCond *sync.Cond
 	waitingTasks  []*downloadTask
-	activeTasks   map[*entryState]*downloadTask
+	activeTasks   map[*entryState]map[*downloadTask]struct{}
 	nextTaskSeq   uint64
 
 	mu     sync.Mutex
@@ -348,6 +349,8 @@ type Reader struct {
 	cacheOnly bool
 	closed    atomic.Bool
 	closeOnce sync.Once
+	fileMu    sync.RWMutex
+	file      *os.File
 
 	cursorMu  sync.Mutex
 	pos       int64
@@ -558,7 +561,7 @@ func New(ctx context.Context, opt Options) (*Cache, error) {
 		verifyChecksum:    merged.VerifyChecksum,
 		touchInterval:     merged.TouchInterval,
 		states:            make(map[string]*entryState),
-		activeTasks:       make(map[*entryState]*downloadTask),
+		activeTasks:       make(map[*entryState]map[*downloadTask]struct{}),
 	}
 	c.schedulerCond = sync.NewCond(&c.schedulerMu)
 	if merged.CleanOnStart {

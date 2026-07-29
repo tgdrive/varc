@@ -41,7 +41,7 @@ func TestReadIdleTimeoutRetriesFromLastProgress(t *testing.T) {
 	opt.CacheDir = t.TempDir()
 	opt.ChunkSize = int64(len(data))
 	opt.ChunkSizeLimit = opt.ChunkSize
-	opt.PreloadChunks = 0
+	opt.PreloadChunks = -1
 	opt.ReadIdleTimeout = 20 * time.Millisecond
 	opt.ReadRetryCount = 2
 	opt.ReadRetryDelay = time.Millisecond
@@ -138,7 +138,7 @@ func TestReadIdleTimeoutTracksEverySourceRead(t *testing.T) {
 	opt.CacheDir = t.TempDir()
 	opt.ChunkSize = int64(len(data))
 	opt.ChunkSizeLimit = opt.ChunkSize
-	opt.PreloadChunks = 0
+	opt.PreloadChunks = -1
 	opt.ReadIdleTimeout = 120 * time.Millisecond
 	opt.ReadRetryCount = 0
 	opt.NoBackground = true
