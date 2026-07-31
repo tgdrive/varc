@@ -389,16 +389,18 @@ type downloadTask struct {
 	end   int64
 	key   string
 
-	ctx           context.Context
-	cancel        context.CancelFunc
-	priority      taskPriority
-	sequence      uint64
-	started       bool
-	preloadOwners map[*Reader]struct{}
-	file          *os.File // guarded by state.mu; lazily opened on the first cache write
-	done          bool
-	err           error
-	generation    uint64
+	downloaded int64
+
+	ctx        context.Context
+	cancel     context.CancelFunc
+	priority   taskPriority
+	sequence   uint64
+	started    bool
+	owners     map[*Reader]struct{}
+	file       *os.File // guarded by state.mu; lazily opened on the first cache write
+	done       bool
+	err        error
+	generation uint64
 }
 
 type cacheMeta struct {

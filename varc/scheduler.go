@@ -22,6 +22,19 @@ const (
 	prioritySpeculativePreload
 )
 
+func (p taskPriority) String() string {
+	switch p {
+	case priorityBlocking:
+		return "blocking"
+	case priorityImmediatePreload:
+		return "immediate-preload"
+	case prioritySpeculativePreload:
+		return "speculative-preload"
+	default:
+		return "unknown"
+	}
+}
+
 // scheduledCoverageLocked returns every byte range that is already durable,
 // progressively readable, or owned by an active task. Callers must hold st.mu.
 func scheduledCoverageLocked(st *entryState) []byteRange {
@@ -37,23 +50,38 @@ func scheduledCoverageLocked(st *entryState) []byteRange {
 	return available
 }
 
-func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, chunkSize int64, priority taskPriority) {
-	c.ensureOwnedTaskLocked(st, src, start, end, chunkSize, priority, nil)
+func (c *Cache) ensureTaskLocked(st *entryState, src io.ReaderAt, start, end, chunkSize int64, priority taskPriority, owner *Reader) {
+	c.ensureOwnedTaskLocked(st, src, start, end, chunkSize, priority, owner)
 }
 
 func (c *Cache) ensurePreloadTaskLocked(st *entryState, src io.ReaderAt, start, end, chunkSize int64, priority taskPriority, owner *Reader) {
 	c.ensureOwnedTaskLocked(st, src, start, end, chunkSize, priority, owner)
 }
 
+func (c *Cache) claimBlockingTaskLocked(st *entryState, start, end int64, owner *Reader) {
+	for _, task := range st.tasks {
+		if task.done || task.err != nil || task.ctx.Err() != nil || task.priority != priorityBlocking {
+			continue
+		}
+		if task.start <= start && task.end >= end {
+			if task.owners == nil {
+				task.owners = make(map[*Reader]struct{})
+			}
+			task.owners[owner] = struct{}{}
+			return
+		}
+	}
+}
+
 func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, end, chunkSize int64, priority taskPriority, owner *Reader) {
 	c.pruneTasksLocked(st)
 	for _, task := range st.tasks {
-		if !task.done && task.err == nil && task.start <= start && task.end >= end {
-			if owner != nil && task.priority != priorityBlocking {
-				if task.preloadOwners == nil {
-					task.preloadOwners = make(map[*Reader]struct{})
+		if !task.done && task.err == nil && task.ctx.Err() == nil && task.start <= start && task.end >= end {
+			if owner != nil {
+				if task.owners == nil {
+					task.owners = make(map[*Reader]struct{})
 				}
-				task.preloadOwners[owner] = struct{}{}
+				task.owners[owner] = struct{}{}
 			}
 			c.promoteTask(task, priority)
 			return
@@ -81,16 +109,17 @@ func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, en
 		src:        src,
 		start:      chunkStart,
 		end:        chunkEnd,
-		key:        key,
+		key:        st.meta.Key,
 		ctx:        taskCtx,
 		cancel:     cancel,
 		priority:   priority,
 		generation: st.generation,
 	}
 	if owner != nil {
-		t.preloadOwners = map[*Reader]struct{}{owner: {}}
+		t.owners = map[*Reader]struct{}{owner: {}}
 	}
 	st.tasks[key] = t
+	c.logger.Debugf("varc: range queued key=%q range=[%d,%d) priority=%s", t.key, t.start, t.end, t.priority)
 	c.schedulerMu.Lock()
 	t.sequence = c.nextTaskSeq
 	c.nextTaskSeq++
@@ -109,13 +138,16 @@ func (c *Cache) ensureOwnedTaskLocked(st *entryState, src io.ReaderAt, start, en
 	go c.runDownloadTask(t)
 }
 
-func (c *Cache) cancelReaderPreloadsLocked(st *entryState, owner *Reader) {
+func (c *Cache) cancelReaderTasksLocked(st *entryState, owner *Reader, includeBlocking bool) {
 	for _, task := range st.tasks {
-		if task.done || task.priority == priorityBlocking || task.preloadOwners == nil {
+		if task.done || task.owners == nil || (!includeBlocking && task.priority == priorityBlocking) {
 			continue
 		}
-		delete(task.preloadOwners, owner)
-		if len(task.preloadOwners) == 0 {
+		delete(task.owners, owner)
+		if len(task.owners) == 0 {
+			if task.ctx.Err() == nil {
+				c.logger.Debugf("varc: range cancel requested key=%q range=[%d,%d) priority=%s", task.key, task.start, task.end, task.priority)
+			}
 			task.cancel()
 		}
 	}
@@ -133,6 +165,8 @@ func (c *Cache) runDownloadTask(t *downloadTask) {
 		return
 	}
 	defer c.releaseTask(t)
+	started := time.Now()
+	c.logger.Debugf("varc: range started key=%q range=[%d,%d) priority=%s", t.key, t.start, t.end, t.priority)
 	src, ok := t.src.(RangeSource)
 	if !ok {
 		src = readerAtRangeSource{ReaderAt: t.src}
@@ -140,6 +174,11 @@ func (c *Cache) runDownloadTask(t *downloadTask) {
 	err := c.runStreamDownloadTask(t, src)
 	if closeErr := c.closeTaskCacheFile(t); closeErr != nil && err == nil {
 		err = closeErr
+	}
+	if err != nil {
+		c.logger.Debugf("varc: range stopped key=%q range=[%d,%d) priority=%s bytes=%d elapsed=%s error=%v", t.key, t.start, t.end, t.priority, t.downloaded, time.Since(started), err)
+	} else {
+		c.logger.Debugf("varc: range completed key=%q range=[%d,%d) priority=%s bytes=%d elapsed=%s", t.key, t.start, t.end, t.priority, t.downloaded, time.Since(started))
 	}
 	c.finishTask(t, err)
 }
@@ -373,6 +412,7 @@ func (c *Cache) consumeRangeStream(ctx context.Context, t *downloadTask, body io
 		buf := buffer[:n]
 		end := offset + int64(n)
 		c.metricSourceReadBytes.Add(int64(n))
+		t.downloaded += int64(n)
 		checksum := uint32(0)
 		if c.verifyChecksum {
 			checksum = crc32.ChecksumIEEE(buf)

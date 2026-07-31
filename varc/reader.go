@@ -205,6 +205,7 @@ func (r *Reader) Close() error {
 		r.fileMu.Unlock()
 		st := r.state
 		st.mu.Lock()
+		r.cache.cancelReaderTasksLocked(st, r, true)
 		if st.readers > 0 {
 			st.readers--
 		}
@@ -269,8 +270,11 @@ func (r *Reader) ensureReadablePrefix(ctx context.Context, start, end int64) (in
 		}
 		for _, availableRange := range available {
 			if availableRange.Start <= start && availableRange.End > start {
+				readEnd := min64(end, availableRange.End)
+				r.cache.claimBlockingTaskLocked(st, start, readEnd, r)
+				r.ensureAdaptivePreloadsLocked(st, readEnd, st.meta.Size)
 				r.meta = st.meta
-				return min64(end, availableRange.End), nil
+				return readEnd, nil
 			}
 		}
 		if !missRecorded {
@@ -315,11 +319,14 @@ func (r *Reader) ensureRangeMode(ctx context.Context, start, end int64, allowVol
 			available = append(available, st.volatile...)
 		}
 		if containsRange(available, start, end) {
+			r.cache.claimBlockingTaskLocked(st, start, end, r)
+			r.ensureAdaptivePreloadsLocked(st, end, st.meta.Size)
 			r.meta = st.meta
 			return nil
 		}
 		missingStart, missingEnd, ok := firstMissingRange(available, start, end)
 		if !ok {
+			r.ensureAdaptivePreloadsLocked(st, end, st.meta.Size)
 			r.meta = st.meta
 			return nil
 		}

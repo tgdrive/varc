@@ -145,9 +145,26 @@ func TestSharedReadersDeduplicateAdaptiveTasks(t *testing.T) {
 	r1.ensureAdaptiveTasksLocked(st, 0, 1, int64(len(src.data)))
 	r2.ensureAdaptiveTasksLocked(st, 0, 1, int64(len(src.data)))
 	got := len(st.tasks)
+	blocking := st.tasks[rangeKey(0, 64)]
+	owners := 0
+	if blocking != nil {
+		owners = len(blocking.owners)
+	}
 	st.mu.Unlock()
 	if got != 2 {
 		t.Fatalf("shared tasks=%d, want one active and one preload", got)
+	}
+	if owners != 2 {
+		t.Fatalf("blocking task owners=%d, want 2", owners)
+	}
+
+	r1.cancelStaleTasks()
+	st.mu.Lock()
+	blockingCanceled := blocking.ctx.Err() != nil
+	owners = len(blocking.owners)
+	st.mu.Unlock()
+	if blockingCanceled || owners != 1 {
+		t.Fatalf("detaching one reader canceled shared blocking task: canceled=%v owners=%d", blockingCanceled, owners)
 	}
 	close(src.release)
 }

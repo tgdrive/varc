@@ -3,6 +3,7 @@ package varc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"sync"
@@ -26,6 +27,60 @@ type slowRcloneSource struct {
 	mu             sync.Mutex
 	logicalRanges  []byteRange
 	physicalChunks map[int64]int
+}
+
+type seekRangeEvent struct {
+	span     byteRange
+	canceled bool
+}
+
+type syntheticSeekSource struct {
+	size int64
+
+	mu          sync.Mutex
+	events      []seekRangeEvent
+	firstReady  chan struct{}
+	firstCancel chan struct{}
+	readyOnce   sync.Once
+	cancelOnce  sync.Once
+}
+
+func (s *syntheticSeekSource) ReadAt([]byte, int64) (int, error) {
+	return 0, errors.New("streaming path not used")
+}
+
+func (s *syntheticSeekSource) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
+	s.mu.Lock()
+	index := len(s.events)
+	s.events = append(s.events, seekRangeEvent{span: byteRange{Start: start, End: end + 1}})
+	s.mu.Unlock()
+	if index != 0 {
+		return io.NopCloser(&virtualRangeReader{pos: start, end: end + 1}), nil
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		prefixEnd := min64(end+1, start+mebi)
+		_, err := io.CopyN(pw, &virtualRangeReader{pos: start, end: prefixEnd}, prefixEnd-start)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		s.readyOnce.Do(func() { close(s.firstReady) })
+		<-ctx.Done()
+		s.mu.Lock()
+		s.events[0].canceled = true
+		s.mu.Unlock()
+		s.cancelOnce.Do(func() { close(s.firstCancel) })
+		_ = pw.CloseWithError(ctx.Err())
+	}()
+	return pr, nil
+}
+
+func (s *syntheticSeekSource) snapshotEvents() []seekRangeEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]seekRangeEvent(nil), s.events...)
 }
 
 func (s *slowRcloneSource) ReadAt([]byte, int64) (int, error) {
@@ -129,6 +184,7 @@ func TestSlowRemoteRcloneChunkFacade(t *testing.T) {
 	if err != nil || n <= 0 {
 		t.Fatalf("initial read n=%d err=%v", n, err)
 	}
+	initialReadBytes := n
 	elapsed := time.Since(start)
 	if elapsed < src.fetchTime {
 		t.Fatalf("initial read returned before full remote chunk fetch: %v", elapsed)
@@ -155,7 +211,8 @@ func TestSlowRemoteRcloneChunkFacade(t *testing.T) {
 	}
 	assertVirtualPattern(t, seekBuf[:n], seekOffset)
 
-	waitForCachedBytesDeadline(t, c, "slow-rclone", 2*chunkSize-17*kibi, 10*time.Second)
+	wantMinimum := chunkSize - 17*kibi + int64(initialReadBytes)
+	waitForCachedBytesAtLeastDeadline(t, c, "slow-rclone", wantMinimum, 10*time.Second)
 	logical, physical := src.snapshot()
 	if physical[0] != 1 || physical[2] != 1 || physical[1] != 0 {
 		t.Fatalf("physical chunk fetches=%v logical=%v", physical, logical)
@@ -199,6 +256,101 @@ func TestSlowRemoteRcloneChunkFacadeThreeStreams(t *testing.T) {
 	// The race detector instruments the generated 384 MiB byte stream heavily.
 	waitForCoverageDeadline(t, c, "slow-rclone-parallel", fileSize, 30*time.Second)
 	assertRcloneFetches(t, src, fileSize, 1)
+}
+
+func TestSyntheticLargeMediaFiveSecondSeekRestartsBlockedChunk(t *testing.T) {
+	const (
+		fileSize        = int64(1 << 30)
+		chunkSize       = int64(128 * mebi)
+		mediaBitsPerSec = int64(20_000_000)
+		seekSeconds     = int64(5)
+	)
+	seekOffset := mediaBitsPerSec / 8 * seekSeconds
+
+	opt := testOptions(t.TempDir())
+	opt.ChunkSize = chunkSize
+	opt.ChunkSizeLimit = chunkSize
+	opt.PreloadChunks = 5
+	opt.ReadRetryCount = -1
+	c, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	src := &syntheticSeekSource{
+		size:        fileSize,
+		firstReady:  make(chan struct{}),
+		firstCancel: make(chan struct{}),
+	}
+	r, err := c.Open(context.Background(), "synthetic-five-second-seek", fileSize, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if _, err := r.Read(make([]byte, 64*kibi)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-src.firstReady:
+	case <-time.After(time.Second):
+		t.Fatal("initial 128 MiB origin range did not become readable")
+	}
+	if _, err := r.Seek(seekOffset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+
+	seekDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64*kibi)
+		n, err := r.Read(buf)
+		if err == nil {
+			for i, got := range buf[:n] {
+				want := byte((seekOffset + int64(i)) % 251)
+				if got != want {
+					err = fmt.Errorf("byte %d=%d, want %d", i, got, want)
+					break
+				}
+			}
+		}
+		seekDone <- err
+	}()
+
+	select {
+	case <-src.firstCancel:
+	case <-time.After(time.Second):
+		t.Fatal("seek did not cancel the obsolete in-window origin range")
+	}
+	select {
+	case err := <-seekDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("five-second seek remained blocked behind the original 128 MiB range")
+	}
+
+	events := src.snapshotEvents()
+	for i, event := range events {
+		t.Logf("origin range %d: %d-%d canceled=%v", i, event.span.Start, event.span.End, event.canceled)
+	}
+	if len(events) < 2 {
+		t.Fatalf("origin ranges=%+v, want initial and seek ranges", events)
+	}
+	if events[0].span != (byteRange{Start: 0, End: chunkSize}) || !events[0].canceled {
+		t.Fatalf("initial origin range=%+v, want canceled 0-%d", events[0], chunkSize)
+	}
+	seekRangeFound := false
+	for _, event := range events[1:] {
+		if event.span.Start == seekOffset {
+			seekRangeFound = true
+			break
+		}
+	}
+	if !seekRangeFound {
+		t.Fatalf("no origin range starts at seek offset %d; ranges=%+v", seekOffset, events)
+	}
 }
 
 func newSlowRcloneSource(size, chunkSize int64) *slowRcloneSource {
@@ -251,6 +403,20 @@ func waitForCachedBytesDeadline(t *testing.T, c *Cache, key string, want int64, 
 	}
 	cached, size, complete, err := c.Coverage(key)
 	t.Fatalf("cached bytes for %q did not reach %d: cached=%d size=%d complete=%v err=%v", key, want, cached, size, complete, err)
+}
+
+func waitForCachedBytesAtLeastDeadline(t *testing.T, c *Cache, key string, want int64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		cached, _, _, err := c.Coverage(key)
+		if err == nil && cached >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cached, size, complete, err := c.Coverage(key)
+	t.Fatalf("cached bytes for %q did not reach at least %d: cached=%d size=%d complete=%v err=%v", key, want, cached, size, complete, err)
 }
 
 func waitForCoverageDeadline(t *testing.T, c *Cache, key string, want int64, timeout time.Duration) {

@@ -31,7 +31,10 @@ preload_chunks 1
 
 `chunk_size_limit` is the largest request size used after sustained sequential reads.
 
-`preload_chunks` is the number of future chunks queued behind the current blocking read.
+`preload_chunks` is the number of future chunks maintained ahead of the current
+read window. The rolling window advances when the reader consumes data, not
+when a preload finishes, so paused consumption does not pull the rest of the
+object by itself.
 
 Sequential readers grow like this:
 
@@ -40,6 +43,9 @@ Sequential readers grow like this:
 ```
 
 A seek or random read resets the reader to `chunk_size`.
+
+With Caddy debug logging enabled, VARC logs each queued, started, canceled, and
+completed range as an end-exclusive byte interval such as `range=[0,134217728)`.
 
 For fixed 128 MiB chunks:
 

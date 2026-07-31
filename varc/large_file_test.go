@@ -247,3 +247,66 @@ func TestLargeFileFrequentRandomSeeksRemainCorrect(t *testing.T) {
 		t.Fatal("random seeks made no origin requests")
 	}
 }
+
+func TestRollingPreloadsAdvanceOnCachedReadButNotCompletion(t *testing.T) {
+	const (
+		chunkSize = int64(1 << 20)
+		fileSize  = 6 * chunkSize
+	)
+
+	opt := testOptions(t.TempDir())
+	opt.ChunkSize = chunkSize
+	opt.ChunkSizeLimit = chunkSize
+	opt.PreloadChunks = 2
+	cache, err := New(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	src := &recordedGeneratedSource{size: fileSize}
+	reader, err := cache.Open(context.Background(), "rolling-preloads", fileSize, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	if _, err := reader.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForCachedBytesDeadline(t, cache, "rolling-preloads", 3*chunkSize, 2*time.Second)
+	initialRanges := src.snapshotRanges()
+	if len(initialRanges) != 3 {
+		t.Fatalf("initial origin ranges=%+v, want active chunk plus two preloads", initialRanges)
+	}
+
+	// Completing preloads must not pull the rest of a paused stream.
+	time.Sleep(25 * time.Millisecond)
+	if ranges := src.snapshotRanges(); len(ranges) != 3 {
+		t.Fatalf("preload completion scheduled more work without consumption: %+v", ranges)
+	}
+
+	// Entering an already-cached window must add one new chunk at the tail.
+	if _, err := reader.Seek(chunkSize, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForCachedBytesDeadline(t, cache, "rolling-preloads", 4*chunkSize, 2*time.Second)
+	ranges := src.snapshotRanges()
+	if len(ranges) != 4 {
+		t.Fatalf("rolling preloads made duplicate origin requests: %+v", ranges)
+	}
+	wantTail := byteRange{Start: 3 * chunkSize, End: 4 * chunkSize}
+	foundTail := false
+	for _, span := range ranges {
+		if span == wantTail {
+			foundTail = true
+			break
+		}
+	}
+	if !foundTail {
+		t.Fatalf("cached read did not extend rolling preload tail to %+v: %+v", wantTail, ranges)
+	}
+}

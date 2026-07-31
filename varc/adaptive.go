@@ -74,15 +74,23 @@ func (r *Reader) resetAdaptive(off int64) {
 	r.adaptiveMu.Lock()
 	r.resetAdaptiveLocked(off)
 	r.adaptiveMu.Unlock()
-	r.cancelStalePreloads()
+	r.cancelStaleTasks()
+}
+
+func (r *Reader) cancelStaleTasks() {
+	r.cancelOwnedTasks(true)
 }
 
 func (r *Reader) cancelStalePreloads() {
+	r.cancelOwnedTasks(false)
+}
+
+func (r *Reader) cancelOwnedTasks(includeBlocking bool) {
 	if r == nil || r.cache == nil || r.state == nil {
 		return
 	}
 	r.state.mu.Lock()
-	r.cache.cancelReaderPreloadsLocked(r.state, r)
+	r.cache.cancelReaderTasksLocked(r.state, r, includeBlocking)
 	r.state.mu.Unlock()
 }
 
@@ -120,12 +128,24 @@ func (r *Reader) adaptiveChunkSize() int64 {
 }
 
 func (r *Reader) ensureAdaptiveTasksLocked(st *entryState, start, end, fileSize int64) {
-	chunkSize, windowEnd := r.adaptiveWindow()
+	chunkSize, _ := r.adaptiveWindow()
+	r.cache.claimBlockingTaskLocked(st, start, end, r)
 	missingStart, missingEnd, ok := firstMissingRange(scheduledCoverageLocked(st), start, end)
 	if ok {
-		r.cache.ensureTaskLocked(st, r.src, missingStart, missingEnd, chunkSize, priorityBlocking)
+		r.cache.ensureTaskLocked(st, r.src, missingStart, missingEnd, chunkSize, priorityBlocking, r)
 	}
-	preloadStart := max64(end, windowEnd)
+	r.ensureAdaptivePreloadsLocked(st, end, fileSize)
+}
+
+func (r *Reader) ensureAdaptivePreloadsLocked(st *entryState, readEnd, fileSize int64) {
+	if r.src == nil || r.cacheOnly || r.cache.preloadChunks <= 0 {
+		return
+	}
+	chunkSize, windowEnd := r.adaptiveWindow()
+	preloadStart := windowEnd
+	for preloadStart < readEnd {
+		preloadStart = saturatingAdd(preloadStart, chunkSize)
+	}
 	for i := 0; i < r.cache.preloadChunks && preloadStart < fileSize; i++ {
 		preloadEnd := min64(fileSize, saturatingAdd(preloadStart, chunkSize))
 		priority := prioritySpeculativePreload
