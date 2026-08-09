@@ -170,7 +170,3 @@ go vet ./...
 ```
 
 Run the same commands from `caddy/` for the optional Caddy module.
-
-## Third-party notice
-
-Parts of the range/cache/read-scheduling implementation retain an upstream MIT permission notice. Keep `THIRD_PARTY_NOTICES.md` when distributing substantial copied portions.
