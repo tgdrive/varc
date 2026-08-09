@@ -152,7 +152,12 @@ func TestCacheKeyTemplate(t *testing.T) {
 
 func TestDynamicUpstreamTemplate(t *testing.T) {
 	data := []byte("0123456789")
+	var wantHost string
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != wantHost {
+			http.Error(w, "unexpected origin host", http.StatusBadRequest)
+			return
+		}
 		if r.URL.Path != "/movie.bin" || r.URL.Query().Get("token") != "abc" {
 			http.Error(w, "unexpected origin URL", http.StatusBadRequest)
 			return
@@ -160,6 +165,11 @@ func TestDynamicUpstreamTemplate(t *testing.T) {
 		http.ServeContent(w, r, "movie.bin", time.Unix(1, 0), bytes.NewReader(data))
 	}))
 	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHost = originURL.Host
 
 	h := &Handler{
 		Upstream: "{http.request.uri.query.target}",

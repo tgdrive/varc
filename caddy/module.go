@@ -73,7 +73,8 @@ func (h *Handler) provision(ctx context.Context) error {
 
 	var sourceKey proxy.KeyFunc
 	var src *httpsource.Source
-	if strings.Contains(h.Upstream, "{") {
+	dynamicUpstream := strings.Contains(h.Upstream, "{")
+	if dynamicUpstream {
 		sourceKey = func(r *http.Request) (string, error) {
 			repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 			if repl == nil {
@@ -106,6 +107,14 @@ func (h *Handler) provision(ctx context.Context) error {
 	}
 	if h.Headers != nil {
 		src.Header = h.Headers.Clone()
+	}
+	if dynamicUpstream {
+		if src.Header == nil {
+			src.Header = make(http.Header)
+		}
+		if _, configured := src.Header["Host"]; !configured {
+			src.Header["Host"] = nil
+		}
 	}
 
 	opt := cache.DefaultOptions()
