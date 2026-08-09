@@ -161,6 +161,19 @@ func (h *Handler) provision(ctx context.Context) error {
 	}
 	h.cache = c
 	h.handler = &proxy.Handler{Cache: c, Key: sourceKey}
+	if dynamicUpstream {
+		h.handler.CacheKey = func(r *http.Request) (string, error) {
+			resolved, err := sourceKey(r)
+			if err != nil {
+				return "", err
+			}
+			u, err := url.Parse(resolved)
+			if err != nil {
+				return "", fmt.Errorf("varc: parse resolved upstream: %w", err)
+			}
+			return proxy.PathKey(&http.Request{URL: u})
+		}
+	}
 	if h.Key != "" {
 		h.handler.CacheKey = newCacheKeyFunc(h.Key)
 	}

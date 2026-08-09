@@ -184,6 +184,13 @@ func TestDynamicUpstreamTemplate(t *testing.T) {
 
 	target := origin.URL + "/movie.bin?token=abc"
 	req := httptest.NewRequest(http.MethodGet, "http://localhost:8888/?target="+url.QueryEscape(target), nil)
+	cacheKey, err := h.handler.CacheKey(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cacheKey != "movie.bin" {
+		t.Fatalf("dynamic cache key = %q, want %q", cacheKey, "movie.bin")
+	}
 	req.Header.Set("Range", "bytes=2-5")
 	rr := httptest.NewRecorder()
 	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
