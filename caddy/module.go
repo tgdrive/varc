@@ -71,25 +71,39 @@ func (h *Handler) provision(ctx context.Context) error {
 		return errors.New("varc: cache_dir is required")
 	}
 
-	base, err := url.Parse(h.Upstream)
-	if err != nil {
-		return fmt.Errorf("varc: parse upstream: %w", err)
+	var sourceKey proxy.KeyFunc
+	var src *httpsource.Source
+	if strings.Contains(h.Upstream, "{") {
+		sourceKey = func(r *http.Request) (string, error) {
+			repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+			if repl == nil {
+				repl = caddy.NewReplacer()
+				r = caddyhttp.PrepareRequest(r, repl, nil, nil)
+			}
+			resolved, err := repl.ReplaceOrErr(h.Upstream, false, true)
+			if err != nil {
+				return "", fmt.Errorf("varc: expand upstream: %w", err)
+			}
+			u, err := parseUpstreamURL(resolved)
+			if err != nil {
+				return "", err
+			}
+			return u.String(), nil
+		}
+		src = httpsource.New(http.DefaultClient, func(_ context.Context, key string) (string, error) {
+			return key, nil
+		})
+	} else {
+		base, err := parseUpstreamURL(h.Upstream)
+		if err != nil {
+			return err
+		}
+		src = httpsource.New(http.DefaultClient, func(_ context.Context, key string) (string, error) {
+			parts := strings.Split(strings.Trim(key, "/"), "/")
+			resolved := base.JoinPath(parts...)
+			return resolved.String(), nil
+		})
 	}
-	if base.Scheme != "http" && base.Scheme != "https" {
-		return fmt.Errorf("varc: upstream scheme must be http or https")
-	}
-	if base.Host == "" {
-		return errors.New("varc: upstream host is required")
-	}
-	if base.Fragment != "" {
-		return errors.New("varc: upstream must not contain a URL fragment")
-	}
-
-	src := httpsource.New(http.DefaultClient, func(_ context.Context, key string) (string, error) {
-		parts := strings.Split(strings.Trim(key, "/"), "/")
-		resolved := base.JoinPath(parts...)
-		return resolved.String(), nil
-	})
 	if h.Headers != nil {
 		src.Header = h.Headers.Clone()
 	}
@@ -137,11 +151,28 @@ func (h *Handler) provision(ctx context.Context) error {
 		return fmt.Errorf("varc: initialize cache: %w", err)
 	}
 	h.cache = c
-	h.handler = &proxy.Handler{Cache: c}
+	h.handler = &proxy.Handler{Cache: c, Key: sourceKey}
 	if h.Key != "" {
 		h.handler.CacheKey = newCacheKeyFunc(h.Key)
 	}
 	return nil
+}
+
+func parseUpstreamURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("varc: parse upstream: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, errors.New("varc: upstream scheme must be http or https")
+	}
+	if u.Host == "" {
+		return nil, errors.New("varc: upstream host is required")
+	}
+	if u.Fragment != "" {
+		return nil, errors.New("varc: upstream must not contain a URL fragment")
+	}
+	return u, nil
 }
 
 // Validate verifies that provisioning produced a usable handler.

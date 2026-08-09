@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -146,6 +147,44 @@ func TestCacheKeyTemplate(t *testing.T) {
 	keyFunc = newCacheKeyFunc("{does.not.exist}")
 	if _, err := keyFunc(req); err == nil {
 		t.Fatal("unknown placeholder unexpectedly succeeded")
+	}
+}
+
+func TestDynamicUpstreamTemplate(t *testing.T) {
+	data := []byte("0123456789")
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/movie.bin" || r.URL.Query().Get("token") != "abc" {
+			http.Error(w, "unexpected origin URL", http.StatusBadRequest)
+			return
+		}
+		http.ServeContent(w, r, "movie.bin", time.Unix(1, 0), bytes.NewReader(data))
+	}))
+	defer origin.Close()
+
+	h := &Handler{
+		Upstream: "{http.request.uri.query.target}",
+		CacheDir: t.TempDir(),
+	}
+	zero := caddy.Duration(0)
+	h.CachePollInterval = &zero
+	if err := h.provision(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer h.Cleanup()
+
+	target := origin.URL + "/movie.bin?token=abc"
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8888/?target="+url.QueryEscape(target), nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rr := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		t.Fatal("GET unexpectedly continued to next handler")
+		return nil
+	})
+	if err := h.ServeHTTP(rr, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusPartialContent || rr.Body.String() != "2345" {
+		t.Fatalf("dynamic upstream response = %d %q", rr.Code, rr.Body.String())
 	}
 }
 
