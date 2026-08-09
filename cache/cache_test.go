@@ -850,6 +850,23 @@ func TestShardedPath(t *testing.T) {
 	}
 }
 
+func TestPathsForKeyUsesTruncatedSHA256(t *testing.T) {
+	c := &Cache{
+		data: "data",
+		meta: "meta",
+		opt:  Options{CacheShardDepth: 0},
+	}
+
+	dataPath, metaPath := c.pathsForKey("movie")
+	const wantName = "8a6ba32c9bed6ce703f999f9af6ec236"
+	if got := filepath.Base(dataPath); got != wantName {
+		t.Fatalf("data filename = %q, want %q", got, wantName)
+	}
+	if got := filepath.Base(metaPath); got != wantName+".json" {
+		t.Fatalf("metadata filename = %q, want %q", got, wantName+".json")
+	}
+}
+
 func TestShardDepthMigrationPreservesCachedRanges(t *testing.T) {
 	dir := t.TempDir()
 	src := newMemorySource()

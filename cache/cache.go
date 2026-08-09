@@ -580,7 +580,7 @@ func (c *Cache) Close() error {
 
 func (c *Cache) pathsForKey(key string) (dataPath, metaPath string) {
 	sum := sha256.Sum256([]byte(key))
-	name := hex.EncodeToString(sum[:])
+	name := hex.EncodeToString(sum[:16])
 	return shardedPath(c.data, name, c.opt.CacheShardDepth), shardedPath(c.meta, name+".json", c.opt.CacheShardDepth)
 }
 
