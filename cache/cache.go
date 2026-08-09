@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"vfs-cache/internal/cachecore/diskusage"
-	internalfs "vfs-cache/internal/cachecore/fs"
-	"vfs-cache/ranges"
-	"vfs-cache/source"
+	diskspace "varc/internal/engine/diskspace"
+	"varc/internal/engine/objectio"
+	"varc/ranges"
+	"varc/source"
 )
 
 // Cache owns cached objects and the background eviction loop.
@@ -80,7 +80,7 @@ func New(ctx context.Context, dir string, src source.Source, opt Options) (*Cach
 	}
 
 	cacheCtx, cancel := context.WithCancel(ctx)
-	cacheCtx = internalfs.WithConfig(cacheCtx, internalfs.ConfigInfo{BufferSize: opt.BufferSize})
+	cacheCtx = objectio.WithConfig(cacheCtx, objectio.Config{BufferSize: opt.BufferSize})
 	c := &Cache{
 		ctx:    cacheCtx,
 		cancel: cancel,
@@ -305,8 +305,8 @@ func (c *Cache) minFreeSpaceQuotaOK() bool {
 	if c.opt.CacheMinFreeSpace <= 0 {
 		return true
 	}
-	du, err := diskusage.New(c.root)
-	if errors.Is(err, diskusage.ErrUnsupported) {
+	du, err := diskspace.New(c.root)
+	if errors.Is(err, diskspace.ErrUnsupported) {
 		return true
 	}
 	if err != nil {
@@ -370,7 +370,7 @@ func (c *Cache) clean(kicked bool) {
 
 		// If quota is still exceeded, reset clean cache contents even for open
 		// items. resetForSpace skips grace-period and actively accessed items,
-		// matching the VFS reset coordination.
+		// preserving reset coordination for active readers.
 		for i := range items {
 			if c.quotasOK(used) {
 				break
@@ -407,7 +407,7 @@ func (c *Cache) clean(kicked bool) {
 }
 
 // KickCleaner wakes the cleaner after an ENOSPC error and waits until that
-// cleaning pass releases blocked I/O, following the VFS cache coordination.
+// cleaning pass releases blocked I/O.
 func (c *Cache) KickCleaner() {
 	if c.opt.CachePollInterval <= 0 {
 		return

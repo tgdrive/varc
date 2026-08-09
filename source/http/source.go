@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"vfs-cache/source"
+	"varc/source"
 )
 
 // Resolver maps a cache key to an upstream URL.

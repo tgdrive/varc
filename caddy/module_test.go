@@ -15,7 +15,7 @@ import (
 )
 
 func TestModuleID(t *testing.T) {
-	if got := (Handler{}).CaddyModule().ID; got != "http.handlers.vfs_cache" {
+	if got := (Handler{}).CaddyModule().ID; got != "http.handlers.varc" {
 		t.Fatalf("module ID = %q", got)
 	}
 }
@@ -53,8 +53,8 @@ func TestParseBytes(t *testing.T) {
 }
 
 func TestUnmarshalCaddyfile(t *testing.T) {
-	d := caddyfile.NewTestDispenser(`vfs_cache https://origin.example/base {
-	cache_dir /var/cache/vfs-cache
+	d := caddyfile.NewTestDispenser(`varc https://origin.example/base {
+	cache_dir /var/cache/varc
 	max_size 10GiB
 	min_free_space 1GiB
 	shard_depth 2
@@ -73,7 +73,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	if err := h.UnmarshalCaddyfile(d); err != nil {
 		t.Fatal(err)
 	}
-	if h.Upstream != "https://origin.example/base" || h.CacheDir != "/var/cache/vfs-cache" {
+	if h.Upstream != "https://origin.example/base" || h.CacheDir != "/var/cache/varc" {
 		t.Fatalf("unexpected base config: %+v", h)
 	}
 	if h.CacheMaxSize == nil || *h.CacheMaxSize != 10<<30 {

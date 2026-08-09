@@ -25,7 +25,7 @@ type Options struct {
 	LowLevelRetries int
 }
 
-// DefaultOptions returns the read-cache defaults used by the extracted VFS path.
+// DefaultOptions returns the default sparse-cache settings.
 func DefaultOptions() Options {
 	return Options{
 		CachePollInterval: 60 * time.Second,

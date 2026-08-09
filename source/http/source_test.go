@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"vfs-cache/source"
+	"varc/source"
 )
 
 func resolverFor(server *httptest.Server) Resolver {

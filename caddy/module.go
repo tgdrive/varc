@@ -15,15 +15,15 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 
-	"vfs-cache/cache"
-	"vfs-cache/proxy"
-	httpsource "vfs-cache/source/http"
+	"varc/cache"
+	"varc/proxy"
+	httpsource "varc/source/http"
 )
 
 func init() {
 	caddy.RegisterModule(Handler{})
-	httpcaddyfile.RegisterHandlerDirective("vfs_cache", parseCaddyfile)
-	httpcaddyfile.RegisterDirectiveOrder("vfs_cache", httpcaddyfile.Before, "reverse_proxy")
+	httpcaddyfile.RegisterHandlerDirective("varc", parseCaddyfile)
+	httpcaddyfile.RegisterDirectiveOrder("varc", httpcaddyfile.Before, "reverse_proxy")
 }
 
 // Handler is a Caddy HTTP middleware which serves GET and HEAD requests from
@@ -53,7 +53,7 @@ type Handler struct {
 // CaddyModule returns the module registration information.
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.vfs_cache",
+		ID:  "http.handlers.varc",
 		New: func() caddy.Module { return new(Handler) },
 	}
 }
@@ -65,24 +65,24 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 func (h *Handler) provision(ctx context.Context) error {
 	if h.Upstream == "" {
-		return errors.New("vfs_cache: upstream is required")
+		return errors.New("varc: upstream is required")
 	}
 	if h.CacheDir == "" {
-		return errors.New("vfs_cache: cache_dir is required")
+		return errors.New("varc: cache_dir is required")
 	}
 
 	base, err := url.Parse(h.Upstream)
 	if err != nil {
-		return fmt.Errorf("vfs_cache: parse upstream: %w", err)
+		return fmt.Errorf("varc: parse upstream: %w", err)
 	}
 	if base.Scheme != "http" && base.Scheme != "https" {
-		return fmt.Errorf("vfs_cache: upstream scheme must be http or https")
+		return fmt.Errorf("varc: upstream scheme must be http or https")
 	}
 	if base.Host == "" {
-		return errors.New("vfs_cache: upstream host is required")
+		return errors.New("varc: upstream host is required")
 	}
 	if base.Fragment != "" {
-		return errors.New("vfs_cache: upstream must not contain a URL fragment")
+		return errors.New("varc: upstream must not contain a URL fragment")
 	}
 
 	src := httpsource.New(http.DefaultClient, func(_ context.Context, key string) (string, error) {
@@ -134,7 +134,7 @@ func (h *Handler) provision(ctx context.Context) error {
 
 	c, err := cache.New(ctx, h.CacheDir, src, opt)
 	if err != nil {
-		return fmt.Errorf("vfs_cache: initialize cache: %w", err)
+		return fmt.Errorf("varc: initialize cache: %w", err)
 	}
 	h.cache = c
 	h.handler = &proxy.Handler{Cache: c}
@@ -144,7 +144,7 @@ func (h *Handler) provision(ctx context.Context) error {
 // Validate verifies that provisioning produced a usable handler.
 func (h *Handler) Validate() error {
 	if h.cache == nil || h.handler == nil {
-		return errors.New("vfs_cache: module is not provisioned")
+		return errors.New("varc: module is not provisioned")
 	}
 	return nil
 }
@@ -167,7 +167,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return next.ServeHTTP(w, r)
 	}
 	if h.handler == nil {
-		return errors.New("vfs_cache: handler is not provisioned")
+		return errors.New("varc: handler is not provisioned")
 	}
 	h.handler.ServeHTTP(w, r)
 	return nil
@@ -175,7 +175,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 // UnmarshalCaddyfile parses:
 //
-//	vfs_cache <upstream> {
+//	varc <upstream> {
 //	    cache_dir <path>
 //	    max_size <bytes|KiB|MiB|GiB|TiB>
 //	    min_free_space <bytes|KiB|MiB|GiB|TiB>
@@ -341,7 +341,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.Headers.Add(args[0], strings.Join(args[1:], " "))
 			default:
-				return d.Errf("unrecognized vfs_cache option %q", d.Val())
+				return d.Errf("unrecognized varc option %q", d.Val())
 			}
 		}
 	}

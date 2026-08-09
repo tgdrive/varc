@@ -1,11 +1,8 @@
-module vfs-cache/caddy
+module varc/caddy
 
 go 1.25.0
 
-require (
-	github.com/caddyserver/caddy/v2 v2.11.3
-	vfs-cache v0.0.0
-)
+require github.com/caddyserver/caddy/v2 v2.11.3
 
 require (
 	cel.dev/expr v0.25.1 // indirect
@@ -149,6 +146,7 @@ require (
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.5.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	howett.net/plist v1.0.0 // indirect
+	varc v0.0.0
 )
 
-replace vfs-cache => ..
+replace varc => ..

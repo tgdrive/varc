@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"vfs-cache/internal/cachecore/diskusage"
-	"vfs-cache/source"
+	diskspace "varc/internal/engine/diskspace"
+	"varc/source"
 )
 
 type rangeCall struct {
@@ -344,8 +344,8 @@ func TestCleanResetsOpenItemWhenOverQuota(t *testing.T) {
 
 func TestMinFreeSpaceQuotaEvictsCache(t *testing.T) {
 	dir := t.TempDir()
-	du, err := diskusage.New(dir)
-	if errors.Is(err, diskusage.ErrUnsupported) {
+	du, err := diskspace.New(dir)
+	if errors.Is(err, diskspace.ErrUnsupported) {
 		t.Skip("disk usage unsupported")
 	}
 	if err != nil {

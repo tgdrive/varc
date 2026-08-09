@@ -5,12 +5,11 @@ import (
 	"io"
 	"sync"
 
-	internalfs "vfs-cache/internal/cachecore/fs"
-	"vfs-cache/source"
+	"varc/internal/engine/objectio"
+	"varc/source"
 )
 
-// sourceObject adapts the standalone Source interface to the narrow object
-// contract consumed by the downloader/chunked-reader path.
+// sourceObject adapts Source to the narrow object contract used by the cache engine.
 type sourceObject struct {
 	src source.Source
 	key string
@@ -39,25 +38,19 @@ func (o *sourceObject) snapshotRequest() (source.Metadata, map[string][]string) 
 	return o.meta, cloneHeaderMap(o.headers)
 }
 
-func (o *sourceObject) Open(ctx context.Context, options ...internalfs.OpenOption) (io.ReadCloser, error) {
+func (o *sourceObject) Open(ctx context.Context, span *objectio.Span) (io.ReadCloser, error) {
 	meta, headers := o.snapshotRequest()
 	start := int64(0)
 	end := meta.Size
-	for _, option := range options {
-		rangeOption, ok := option.(*internalfs.RangeOption)
-		if !ok {
-			continue
-		}
-		start = rangeOption.Start
-		if rangeOption.End >= 0 {
-			end = rangeOption.End + 1
+	if span != nil {
+		start = span.Start
+		if span.End >= 0 {
+			end = span.End + 1
 		}
 	}
 	if start < 0 || start >= meta.Size {
 		return nil, source.ErrRangeNotSatisfiable
 	}
-	// Backends commonly accept an inclusive range end past EOF and clip it to
-	// the object. Do the same before crossing the stricter Source boundary.
 	if end > meta.Size {
 		end = meta.Size
 	}
@@ -81,4 +74,4 @@ func cloneHeaderMap(headers map[string][]string) map[string][]string {
 	return cloned
 }
 
-var _ internalfs.Object = (*sourceObject)(nil)
+var _ objectio.Object = (*sourceObject)(nil)

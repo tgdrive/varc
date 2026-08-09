@@ -1,8 +1,6 @@
-# vfs-cache
+# varc
 
-A read-only sparse object cache for Go HTTP servers and Caddy.
-
-The read/cache path preserves the proven VFS sparse-cache behavior while the public source boundary stays backend-neutral and reusable.
+`varc` is a read-only sparse object cache for Go HTTP servers and Caddy. It is designed for large objects that are served through HTTP byte ranges and should be cached locally without downloading the complete object first.
 
 ## Architecture
 
@@ -21,62 +19,66 @@ net/http or Caddy
  sparse cache file + persisted range metadata
        |
        v
- downloader state machine
+ range scheduler
        |
        +--> sequential adaptive chunk reader
        |
        +--> parallel chunk streams
 ```
 
-The core `cache`, `source`, and `proxy` packages do not depend on Caddy. Caddy support is a separate nested module under `caddy/`, so normal Go-library users do not inherit Caddy's dependency tree.
+The core `cache`, `source`, and `proxy` packages do not depend on Caddy. Caddy support is a separate nested module under `caddy/`, so ordinary library users do not inherit Caddy's dependency tree.
 
-## VFS read-path behavior retained
+The internal engine is organized by its responsibilities rather than by compatibility layers:
 
-The standalone cache keeps the read-only behavior that matters for ranged object serving:
+```text
+internal/engine/
+  scheduler/    reusable range-fetch coordination
+  chunkstream/  sequential and parallel chunk readers
+  streambuf/    asynchronous origin-read buffering
+  bufferpool/   reusable byte buffers and stream FIFO storage
+  objectio/     narrow internal object/range contract
+  sparsefile/   platform sparse-file support
+  diskspace/    free-space queries
+  ioerrors/     filesystem error classification
+  mapbuffer/    platform memory-mapping support
+  readutil/     small read helpers
+```
 
-- Sparse local cache files and persisted cached-range metadata.
-- Cache metadata reload and cached-byte usage reconstruction on process restart.
-- Deterministic SHA-256 cache-directory sharding with configurable depth and startup migration when depth changes.
-- Downloader waiter coordination for concurrent and overlapping reads.
-- Reuse of an existing downloader for nearby sequential reads.
-- Downloader idle grace period of 5 seconds.
-- Minimum 1 MiB downloader reuse window and 1 MiB already-cached skip threshold.
-- `ReadAhead` extension of the downloader target range.
-- Sequential chunked reading with chunk-size doubling up to `ChunkSizeLimit`.
+## Read-cache behavior
+
+The cache provides:
+
+- Sparse local cache files with persisted cached-range metadata.
+- Cache metadata reload and cached-byte accounting after process restart.
+- Deterministic SHA-256 cache-directory sharding with configurable depth and startup migration when shard depth changes.
+- Waiter coordination for concurrent and overlapping reads.
+- Reuse of an existing range fetch for nearby sequential reads.
+- A 5-second idle grace period for reusable fetchers.
+- A 1 MiB reuse window and already-cached skip threshold.
+- `ReadAhead` extension of requested ranges.
+- Sequential chunk reading with chunk-size doubling up to `ChunkSizeLimit`.
 - Parallel ranged chunk streams controlled by `ChunkStreams`.
-- Asynchronous read buffering and pooled buffers used by the downloader path.
-- Handle-caching grace period before downloader/file teardown.
-- Max-age, max-size, and minimum-free-disk-space cache cleaning.
-- ENOSPC-triggered cleaner wakeup, open-item cache reset, and read retry coordination.
-- Windows sparse-file marking; Unix sparse files use the normal filesystem behavior.
-- Source-version validation so bytes from different object versions are never intentionally mixed.
+- Asynchronous read buffering and pooled buffers.
+- Handle-caching grace before range-fetch and file teardown.
+- Max-age, max-size, and minimum-free-disk-space cleaning.
+- ENOSPC-triggered cleaner wakeup, active-item range reset, and read retry coordination.
+- Windows sparse-file marking; Unix files rely on normal sparse-file behavior.
+- Source-version validation so cached bytes from different object versions are not intentionally mixed.
 
-The downloader/chunk-reader scheduling is kept structurally aligned with the proven VFS implementation. Internal compatibility packages under `internal/cachecore/` provide the narrow object and buffer plumbing used by the cache engine.
-
-## Intentionally excluded
-
-This project is a read-only object cache, not a mounted VFS. It intentionally does not include:
-
-- writes or writeback uploads;
-- directory cache/listing behavior;
-- rename/remove/write VFS operations;
-- FUSE/mount integration;
-- ownership, permissions, or symlink handling;
-- backend/remote discovery;
-- RC/status integrations, transfer statistics, or bandwidth limiting.
+The project is intentionally read-only. It does not implement writes, upload/writeback behavior, directory listings, rename/remove operations, mount integration, ownership/permission emulation, backend discovery, transfer statistics, or bandwidth limiting.
 
 The cache directory should be owned by one cache process at a time; multi-process cache-directory locking is not implemented.
 
 ## Cache options
 
-`cache.DefaultOptions()` currently returns:
+`cache.DefaultOptions()` returns:
 
 ```text
 CachePollInterval = 60s
 CacheMaxAge       = 1h
 CacheMaxSize      = -1        # unlimited
 CacheMinFreeSpace = -1        # disabled
-CacheShardDepth    = 1         # one 2-hex-character shard directory
+CacheShardDepth   = 1         # one 2-hex-character shard directory
 ChunkSize         = 128 MiB
 ChunkSizeLimit    = -1        # unlimited growth limit
 ChunkStreams      = 0         # sequential reader
@@ -88,9 +90,11 @@ LowLevelRetries   = 10
 
 For parallel range fetching, set `ChunkStreams` above 1. For sequential adaptive fetching, leave `ChunkStreams` at 0 or 1 and configure `ChunkSize` / `ChunkSizeLimit` as needed.
 
+`CacheShardDepth` controls the number of two-hex-character hash directories. For example, depth 2 stores an object under `data/ab/cd/<sha256>` and its metadata under the matching `meta/ab/cd/` path.
+
 ## Go usage
 
-The module path is currently local (`vfs-cache`) until a public repository/import path is chosen.
+The module path is currently local (`varc`) until a public repository/import path is chosen.
 
 ```go
 src := httpsource.New(http.DefaultClient, func(ctx context.Context, key string) (string, error) {
@@ -101,7 +105,7 @@ opt := cache.DefaultOptions()
 opt.ReadAhead = 8 << 20
 opt.ChunkStreams = 3
 
-c, err := cache.New(context.Background(), "/var/cache/vfs-cache", src, opt)
+c, err := cache.New(context.Background(), "/var/cache/varc", src, opt)
 if err != nil {
     log.Fatal(err)
 }
@@ -111,21 +115,23 @@ handler := &proxy.Handler{Cache: c}
 log.Fatal(http.ListenAndServe(":8080", handler))
 ```
 
-Incoming HTTP request headers such as Authorization, Cookie, tenant, and custom headers are forwarded to the origin for metadata and range requests. Cache identity remains based only on the object key, so different credentials for the same key share the same cached file. The cache owns representation-control headers: client `Range`, `If-Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` are stripped from internal metadata requests, and cache-generated `Range` / `If-Range` values are used for range fetches. Static headers configured on `source/http.Source` override same-named incoming headers.
+Incoming HTTP headers such as `Authorization`, `Cookie`, `Host`, tenant headers, and custom headers are forwarded to the origin for metadata and range requests. Cache identity remains based only on the object key, so different credentials for the same key share the same cached file.
+
+The cache owns representation-control headers. Client `Range`, `If-Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` values are removed from internal metadata requests, and cache-generated `Range` / `If-Range` values are used for range fetches. Static headers configured on `source/http.Source` override same-named incoming headers.
 
 ## Caddy module
 
 The optional Caddy module registers:
 
 ```text
-http.handlers.vfs_cache
+http.handlers.varc
 ```
 
 and the Caddyfile directive:
 
 ```caddyfile
-vfs_cache https://origin.example/files {
-    cache_dir /var/cache/vfs-cache
+varc https://origin.example/files {
+    cache_dir /var/cache/varc
     max_size 100GiB
     min_free_space 5GiB
     shard_depth 2
@@ -144,7 +150,7 @@ vfs_cache https://origin.example/files {
 }
 ```
 
-The directive is ordered before `reverse_proxy`. GET and HEAD requests are served terminally through the cache; cache misses are ranged reads from the configured `upstream`. Incoming request headers are forwarded upstream, while cache identity stays object-key-only. Other HTTP methods continue to the next Caddy handler.
+The directive is ordered before `reverse_proxy`. GET and HEAD requests are served terminally through the cache; misses produce ranged reads against the configured upstream. Incoming ordinary request headers are forwarded upstream while cache identity stays object-key-only. Other HTTP methods continue to the next Caddy handler.
 
 The Caddy adapter provisions one cache instance for a config load and closes it during Caddy cleanup/reload.
 
@@ -152,7 +158,9 @@ When the module has a public import path, a custom Caddy build can include the n
 
 ## Validation
 
-The test suite covers cache persistence, range invalidation, concurrent downloader reuse, sequential adaptive chunk growth, parallel streams, seek/close behavior, quota reset, minimum-free-space eviction, HTTP range handling, and Caddy integration. Run:
+The test suite covers persistence, version invalidation, concurrent fetch reuse, sequential adaptive chunk growth, parallel streams, seek/close behavior, quota reset, minimum-free-space eviction, HTTP range handling, request-header forwarding, sharding migration, and Caddy integration.
+
+Run from the repository root:
 
 ```text
 go test ./...
@@ -164,4 +172,4 @@ Run the same commands from `caddy/` for the optional Caddy module.
 
 ## Third-party notice
 
-Parts of the range/cache/downloader implementation retain an upstream MIT permission notice. Keep `THIRD_PARTY_NOTICES.md` when distributing substantial copied portions.
+Parts of the range/cache/read-scheduling implementation retain an upstream MIT permission notice. Keep `THIRD_PARTY_NOTICES.md` when distributing substantial copied portions.

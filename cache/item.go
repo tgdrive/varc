@@ -14,12 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"vfs-cache/internal/cachecore/downloaders"
-	"vfs-cache/internal/cachecore/file"
-	"vfs-cache/internal/cachecore/fserrors"
-	"vfs-cache/internal/cachecore/vfscommon"
-	"vfs-cache/ranges"
-	"vfs-cache/source"
+	"varc/internal/engine/ioerrors"
+	"varc/internal/engine/scheduler"
+	"varc/internal/engine/sparsefile"
+	"varc/ranges"
+	"varc/source"
 )
 
 type itemInfo struct {
@@ -44,7 +43,7 @@ type Item struct {
 	info            itemInfo
 	meta            source.Metadata
 	object          *sourceObject
-	downloaders     *downloaders.Downloaders
+	downloaders     *scheduler.Downloaders
 	loaded          bool
 	opens           int
 	graceTimer      *time.Timer
@@ -64,13 +63,13 @@ func (item *Item) createDownloadersLocked() {
 	if item.downloaders != nil || item.object == nil || item.info.Size <= 0 {
 		return
 	}
-	opt := &vfscommon.Options{
+	opt := &scheduler.Config{
 		ChunkSize:      item.c.opt.ChunkSize,
 		ChunkSizeLimit: item.c.opt.ChunkSizeLimit,
 		ChunkStreams:   item.c.opt.ChunkStreams,
 		ReadAhead:      item.c.opt.ReadAhead,
 	}
-	item.downloaders = downloaders.New(item.c.ctx, item, opt, item.key, item.object)
+	item.downloaders = scheduler.New(item.c.ctx, item, opt, item.key, item.object)
 }
 
 func (item *Item) openLocked(ctx context.Context, meta source.Metadata) error {
@@ -120,7 +119,7 @@ func (item *Item) openLocked(ctx context.Context, meta source.Metadata) error {
 			return fmt.Errorf("cache: open data file: %w", err)
 		}
 		item.fd = fd
-		if err := file.SetSparse(item.fd); err != nil {
+		if err := sparsefile.SetSparse(item.fd); err != nil {
 			return fmt.Errorf("cache: set sparse: %w", err)
 		}
 	}
@@ -241,7 +240,7 @@ func (item *Item) resetLocked() error {
 }
 
 // resetForSpace empties clean cached ranges while preserving an open reader.
-// It is the read-only equivalent of the VFS cache Reset path used by the quota cleaner.
+// It resets cached ranges in place when the quota cleaner needs space.
 func (item *Item) resetForSpace() (removed bool, spaceFreed int64, err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
@@ -307,26 +306,26 @@ func (item *Item) resetForSpace() (removed bool, spaceFreed int64, err error) {
 	item.info.Rs = nil
 
 	if err = os.MkdirAll(filepath.Dir(item.dataPath), 0o700); err != nil {
-		finishReset(!fserrors.IsErrNoSpace(err))
+		finishReset(!ioerrors.IsNoSpace(err))
 		return false, spaceFreed, err
 	}
 	item.fd, err = os.OpenFile(item.dataPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		finishReset(!fserrors.IsErrNoSpace(err))
+		finishReset(!ioerrors.IsNoSpace(err))
 		return false, spaceFreed, err
 	}
-	if err = file.SetSparse(item.fd); err != nil {
+	if err = sparsefile.SetSparse(item.fd); err != nil {
 		finishReset(true)
 		return false, spaceFreed, err
 	}
 	if err = item.fd.Truncate(item.info.Size); err != nil {
 		_ = item.fd.Close()
 		item.fd = nil
-		finishReset(!fserrors.IsErrNoSpace(err))
+		finishReset(!ioerrors.IsNoSpace(err))
 		return false, spaceFreed, err
 	}
 	if err = item.saveLocked(); err != nil {
-		finishReset(!fserrors.IsErrNoSpace(err))
+		finishReset(!ioerrors.IsNoSpace(err))
 		return false, spaceFreed, err
 	}
 	item.createDownloadersLocked()
@@ -371,7 +370,7 @@ func (item *Item) closeAfterGrace() {
 	_ = item.actualCloseLocked()
 }
 
-// actualCloseLocked follows the VFS close order: stop downloaders first,
+// actualCloseLocked stops range fetches before closing the sparse file,
 // then close the sparse file, then persist the final range metadata.
 func (item *Item) actualCloseLocked() (err error) {
 	item.closing = make(chan struct{})
@@ -422,7 +421,7 @@ func (item *Item) readAt(ctx context.Context, b []byte, off int64) (n int, err e
 		if err == nil || errors.Is(err, io.EOF) {
 			break
 		}
-		if !fserrors.IsErrNoSpace(err) && err.Error() != "no space left on device" {
+		if !ioerrors.IsNoSpace(err) && err.Error() != "no space left on device" {
 			break
 		}
 		item.c.KickCleaner()
@@ -467,7 +466,7 @@ func (item *Item) readAtOnce(ctx context.Context, b []byte, off int64) (int, err
 	return n, err
 }
 
-// ensure follows the VFS cache read path: a hit can extend an existing
+// ensure follows the sparse-cache read path: a hit can extend an existing
 // downloader for future sequential reads; a miss waits for Download to make
 // the requested range present.
 func (item *Item) ensure(_ context.Context, r ranges.Range) error {

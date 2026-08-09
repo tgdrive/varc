@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"vfs-cache/cache"
-	"vfs-cache/source"
+	"varc/cache"
+	"varc/source"
 )
 
 // KeyFunc maps an incoming request to a source/cache key.

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"vfs-cache/cache"
-	httpsource "vfs-cache/source/http"
+	"varc/cache"
+	httpsource "varc/source/http"
 )
 
 type upstreamFixture struct {
