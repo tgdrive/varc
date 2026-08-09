@@ -115,7 +115,7 @@ handler := &proxy.Handler{Cache: c}
 log.Fatal(http.ListenAndServe(":8080", handler))
 ```
 
-Incoming HTTP headers such as `Authorization`, `Cookie`, `Host`, tenant headers, and custom headers are forwarded to the origin for metadata and range requests. Cache identity remains based only on the object key, so different credentials for the same key share the same cached file.
+Incoming HTTP headers such as `Authorization`, `Cookie`, `Host`, tenant headers, and custom headers are forwarded to the origin for metadata and range requests. By default, cache identity is the object key, so different credentials for the same key share the same cached file. Embedders can override only the cache identity with `proxy.Handler.CacheKey` or call `Cache.OpenWithCacheKey` directly without changing the source object key.
 
 The cache owns representation-control headers. Client `Range`, `If-Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` values are removed from internal metadata requests, and cache-generated `Range` / `If-Range` values are used for range fetches. Static headers configured on `source/http.Source` override same-named incoming headers.
 
@@ -132,6 +132,7 @@ and the Caddyfile directive:
 ```caddyfile
 varc https://origin.example/files {
     cache_dir /var/cache/varc
+    key {host}:{uri}
     max_size 100GiB
     min_free_space 5GiB
     shard_depth 2
@@ -150,7 +151,7 @@ varc https://origin.example/files {
 }
 ```
 
-The directive is ordered before `reverse_proxy`. GET and HEAD requests are served terminally through the cache; misses produce ranged reads against the configured upstream. Incoming ordinary request headers are forwarded upstream while cache identity stays object-key-only. Other HTTP methods continue to the next Caddy handler.
+The directive is ordered before `reverse_proxy`. GET and HEAD requests are served terminally through the cache; misses produce ranged reads against the configured upstream. If `key` is omitted, the cache key is the cleaned request path without its leading slash, exactly as before; host, query, and headers do not vary the default key. A configured `key` is expanded per request and changes cache identity only—the origin object path remains the normal cleaned request path. `{host}` and `{uri}` are convenience aliases for Caddy's `{http.request.host}` and `{http.request.uri}` placeholders; `{uri}` includes the query string. Full Caddy request placeholders such as `{http.request.header.X-Tenant}` are also supported. Incoming ordinary request headers are still forwarded upstream. Other HTTP methods continue to the next Caddy handler.
 
 The Caddy adapter provisions one cache instance for a config load and closes it during Caddy cleanup/reload.
 

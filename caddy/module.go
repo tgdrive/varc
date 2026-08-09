@@ -29,10 +29,10 @@ func init() {
 // Handler is a Caddy HTTP middleware which serves GET and HEAD requests from
 // the sparse object cache. Other HTTP methods continue to the next handler.
 type Handler struct {
-	Upstream string      `json:"upstream,omitempty"`
-	CacheDir string      `json:"cache_dir,omitempty"`
-	Headers  http.Header `json:"headers,omitempty"`
-
+	Upstream          string          `json:"upstream,omitempty"`
+	CacheDir          string          `json:"cache_dir,omitempty"`
+	Key               string          `json:"key,omitempty"`
+	Headers           http.Header     `json:"headers,omitempty"`
 	CachePollInterval *caddy.Duration `json:"cache_poll_interval,omitempty"`
 	CacheMaxAge       *caddy.Duration `json:"cache_max_age,omitempty"`
 	CacheMaxSize      *int64          `json:"cache_max_size,omitempty"`
@@ -138,6 +138,9 @@ func (h *Handler) provision(ctx context.Context) error {
 	}
 	h.cache = c
 	h.handler = &proxy.Handler{Cache: c}
+	if h.Key != "" {
+		h.handler.CacheKey = newCacheKeyFunc(h.Key)
+	}
 	return nil
 }
 
@@ -173,10 +176,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return nil
 }
 
+func newCacheKeyFunc(template string) proxy.KeyFunc {
+	template = normalizeCacheKeyTemplate(template)
+	return func(r *http.Request) (string, error) {
+		repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		if repl == nil {
+			repl = caddy.NewReplacer()
+			r = caddyhttp.PrepareRequest(r, repl, nil, nil)
+		}
+		key, err := repl.ReplaceOrErr(template, false, true)
+		if err != nil {
+			return "", fmt.Errorf("varc: expand cache key: %w", err)
+		}
+		if key == "" {
+			return "", errors.New("varc: cache key expanded to an empty string")
+		}
+		return key, nil
+	}
+}
+
+func normalizeCacheKeyTemplate(template string) string {
+	return strings.NewReplacer(
+		"{host}", "{http.request.host}",
+		"{uri}", "{http.request.uri}",
+	).Replace(template)
+}
+
 // UnmarshalCaddyfile parses:
 //
 //	varc <upstream> {
 //	    cache_dir <path>
+//	    key <template>
 //	    max_size <bytes|KiB|MiB|GiB|TiB>
 //	    min_free_space <bytes|KiB|MiB|GiB|TiB>
 //	    max_age <duration>
@@ -208,6 +238,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.CacheDir = value
+			case "key":
+				value, err := oneArg(d)
+				if err != nil {
+					return err
+				}
+				h.Key = value
 			case "max_size":
 				value, err := oneArg(d)
 				if err != nil {

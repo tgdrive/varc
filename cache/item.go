@@ -72,7 +72,7 @@ func (item *Item) createDownloadersLocked() {
 	item.downloaders = scheduler.New(item.c.ctx, item, opt, item.key, item.object)
 }
 
-func (item *Item) openLocked(ctx context.Context, meta source.Metadata) error {
+func (item *Item) openLocked(ctx context.Context, sourceKey string, meta source.Metadata) error {
 	for item.closing != nil {
 		closing := item.closing
 		item.mu.Unlock()
@@ -119,9 +119,7 @@ func (item *Item) openLocked(ctx context.Context, meta source.Metadata) error {
 			return fmt.Errorf("cache: open data file: %w", err)
 		}
 		item.fd = fd
-		if err := sparsefile.SetSparse(item.fd); err != nil {
-			return fmt.Errorf("cache: set sparse: %w", err)
-		}
+		_ = sparsefile.SetSparse(item.fd)
 	}
 	if stat, err := item.fd.Stat(); err != nil {
 		return fmt.Errorf("cache: stat data file: %w", err)
@@ -133,9 +131,9 @@ func (item *Item) openLocked(ctx context.Context, meta source.Metadata) error {
 	}
 
 	if item.object == nil {
-		item.object = &sourceObject{src: item.c.src, key: item.key}
+		item.object = &sourceObject{src: item.c.src}
 	}
-	item.object.updateRequest(meta, source.RequestHeaders(ctx))
+	item.object.updateRequest(sourceKey, meta, source.RequestHeaders(ctx))
 	item.meta = meta
 	item.info.Key = item.key
 	item.info.Size = meta.Size
@@ -280,24 +278,25 @@ func (item *Item) resetForSpace() (removed bool, spaceFreed int64, err error) {
 		}
 	}
 
+	checkErr := func(e error) {
+		if e != nil && err == nil {
+			err = e
+		}
+	}
 	if item.downloaders != nil {
 		dls := item.downloaders
 		item.downloaders = nil
 		item.mu.Unlock()
-		err = dls.Close(nil)
+		checkErr(dls.Close(nil))
 		item.mu.Lock()
+	}
+	if item.fd != nil {
+		checkErr(item.fd.Close())
+		item.fd = nil
 		if err != nil {
 			finishReset(true)
 			return false, 0, err
 		}
-	}
-	if item.fd != nil {
-		if err = item.fd.Close(); err != nil {
-			item.fd = nil
-			finishReset(true)
-			return false, 0, err
-		}
-		item.fd = nil
 	}
 
 	spaceFreed = item.info.Rs.Size()
@@ -314,10 +313,7 @@ func (item *Item) resetForSpace() (removed bool, spaceFreed int64, err error) {
 		finishReset(!ioerrors.IsNoSpace(err))
 		return false, spaceFreed, err
 	}
-	if err = sparsefile.SetSparse(item.fd); err != nil {
-		finishReset(true)
-		return false, spaceFreed, err
-	}
+	_ = sparsefile.SetSparse(item.fd)
 	if err = item.fd.Truncate(item.info.Size); err != nil {
 		_ = item.fd.Close()
 		item.fd = nil
@@ -343,21 +339,24 @@ func (item *Item) closeFDLocked() error {
 }
 
 func (item *Item) release() error {
+	item.preAccess()
+	defer item.postAccess()
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	if item.opens <= 0 {
-		return errors.New("cache: reader closed too many times")
-	}
-	item.opens--
+
 	item.info.ATime = time.Now()
-	if item.opens != 0 {
-		return item.saveLocked()
+	item.opens--
+	if item.opens < 0 {
+		return os.ErrClosed
 	}
-	if item.c.opt.HandleCaching <= 0 {
-		return item.actualCloseLocked()
+	if item.opens > 0 {
+		return nil
 	}
-	item.graceTimer = time.AfterFunc(item.c.opt.HandleCaching, item.closeAfterGrace)
-	return nil
+	if item.c.opt.HandleCaching > 0 {
+		item.graceTimer = time.AfterFunc(item.c.opt.HandleCaching, item.closeAfterGrace)
+		return nil
+	}
+	return item.actualCloseLocked()
 }
 
 func (item *Item) closeAfterGrace() {
@@ -367,17 +366,15 @@ func (item *Item) closeAfterGrace() {
 		return
 	}
 	item.graceTimer = nil
+	item.closing = make(chan struct{})
 	_ = item.actualCloseLocked()
+	close(item.closing)
+	item.closing = nil
 }
 
 // actualCloseLocked stops range fetches before closing the sparse file,
 // then close the sparse file, then persist the final range metadata.
 func (item *Item) actualCloseLocked() (err error) {
-	item.closing = make(chan struct{})
-	defer func() {
-		close(item.closing)
-		item.closing = nil
-	}()
 	if item.downloaders != nil {
 		dls := item.downloaders
 		item.downloaders = nil
@@ -430,53 +427,39 @@ func (item *Item) readAt(ctx context.Context, b []byte, off int64) (n int, err e
 	return n, err
 }
 
-func (item *Item) readAtOnce(ctx context.Context, b []byte, off int64) (int, error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
+func (item *Item) readAtOnce(_ context.Context, b []byte, off int64) (n int, err error) {
 	item.mu.Lock()
-	size := item.info.Size
-	item.mu.Unlock()
-	if off < 0 || off >= size {
+	if item.fd == nil {
+		item.mu.Unlock()
+		return 0, errors.New("cache: item file is not open")
+	}
+	if off < 0 {
+		item.mu.Unlock()
 		return 0, io.EOF
 	}
+	defer item.mu.Unlock()
 
-	want := int64(len(b))
-	clipped := false
-	if off+want > size {
-		want = size - off
-		clipped = true
-	}
-	r := ranges.Range{Pos: off, Size: want}
-	if err := item.ensure(ctx, r); err != nil {
+	r := ranges.Range{Pos: off, Size: int64(len(b))}
+	if err = item.ensureLocked(r); err != nil {
 		return 0, err
 	}
-
-	item.mu.Lock()
-	fd := item.fd
 	item.info.ATime = time.Now()
-	item.mu.Unlock()
-	if fd == nil {
-		return 0, errors.New("cache: item file closed while reader is open")
-	}
-	n, err := fd.ReadAt(b[:want], off)
-	if clipped && err == nil {
-		err = io.EOF
-	}
-	return n, err
+	return item.fd.ReadAt(b, off)
 }
 
-// ensure follows the sparse-cache read path: a hit can extend an existing
-// downloader for future sequential reads; a miss waits for Download to make
-// the requested range present.
-func (item *Item) ensure(_ context.Context, r ranges.Range) error {
-	item.mu.Lock()
+// ensureLocked ensures r is present. The item mutex must be held on entry and
+// is temporarily released while coordinating the scheduler.
+func (item *Item) ensureLocked(r ranges.Range) error {
 	if r.End() > item.info.Size {
 		r.Size = item.info.Size - r.Pos
 	}
 	present := item.info.Rs.Present(r)
+	if !present && item.downloaders == nil {
+		item.createDownloadersLocked()
+	}
 	dls := item.downloaders
 	item.mu.Unlock()
+	defer item.mu.Lock()
 
 	if present {
 		if dls == nil {
@@ -485,7 +468,7 @@ func (item *Item) ensure(_ context.Context, r ranges.Range) error {
 		return dls.EnsureDownloader(r)
 	}
 	if dls == nil {
-		return errors.New("cache: downloader is not available")
+		return errors.New("cache: scheduler is not available")
 	}
 	return dls.Download(r)
 }
@@ -558,8 +541,6 @@ type Reader struct {
 	ctx  context.Context
 	item *Item
 	meta source.Metadata
-	once sync.Once
-	err  error
 }
 
 // ReadAt implements io.ReaderAt using the context supplied to Cache.Open.
@@ -581,8 +562,7 @@ func (r *Reader) Metadata() source.Metadata { return r.meta }
 // Close releases this reader. The underlying file handle may remain alive for
 // Options.HandleCaching.
 func (r *Reader) Close() error {
-	r.once.Do(func() { r.err = r.item.release() })
-	return r.err
+	return r.item.release()
 }
 
 var _ io.ReaderAt = (*Reader)(nil)

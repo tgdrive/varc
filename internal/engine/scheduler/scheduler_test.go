@@ -6,20 +6,24 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"varc/internal/engine/objectio"
 	"varc/ranges"
 )
 
 type downloaderTestItem struct {
-	mu sync.Mutex
-	rs ranges.Ranges
+	mu   sync.Mutex
+	rs   ranges.Ranges
+	size int64
 }
 
 func (i *downloaderTestItem) FindMissing(r ranges.Range) ranges.Range {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	return i.rs.FindMissing(r)
+	out := i.rs.FindMissing(r)
+	out.Clip(i.size)
+	return out
 }
 
 func (i *downloaderTestItem) HasRange(r ranges.Range) bool {
@@ -72,9 +76,9 @@ func (o *downloaderTestObject) Open(_ context.Context, span *objectio.Span) (io.
 }
 
 func TestDownloaderIsReusedForNearbySequentialRange(t *testing.T) {
-	ctx := objectio.WithConfig(context.Background(), objectio.Config{BufferSize: 0})
-	item := new(downloaderTestItem)
+	ctx := objectio.WithConfig(context.Background(), objectio.Config{BufferSize: 0, LowLevelRetries: 10})
 	object := &downloaderTestObject{data: bytes.Repeat([]byte("x"), 128*1024)}
+	item := &downloaderTestItem{size: object.Size()}
 	opt := &Config{ChunkSize: 4096, ChunkSizeLimit: 4096}
 	dls := New(ctx, item, opt, "object", object)
 	defer dls.Close(nil)
@@ -97,6 +101,40 @@ func TestDownloaderIsReusedForNearbySequentialRange(t *testing.T) {
 	defer dls.mu.Unlock()
 	if len(dls.dls) != 1 || dls.dls[0] != first {
 		t.Fatalf("nearby read did not reuse downloader: before=%p after=%v", first, dls.dls)
+	}
+}
+
+func TestDownloadAndEnsureDownloader(t *testing.T) {
+	ctx := objectio.WithConfig(context.Background(), objectio.Config{BufferSize: 0, LowLevelRetries: 10})
+	object := &downloaderTestObject{data: bytes.Repeat([]byte("x"), 3*1024*1024+123)}
+	item := &downloaderTestItem{size: object.Size()}
+	opt := &Config{ChunkSize: 64 * 1024, ChunkSizeLimit: 256 * 1024}
+	dls := New(ctx, item, opt, "object", object)
+	defer dls.Close(nil)
+
+	for _, r := range []ranges.Range{
+		{Pos: 100, Size: 250},
+		{Pos: 500 * 1024, Size: 250},
+		{Pos: 2 * 1024 * 1024, Size: 250},
+	} {
+		if err := dls.Download(r); err != nil {
+			t.Fatalf("Download(%+v): %v", r, err)
+		}
+		if !item.HasRange(r) {
+			t.Fatalf("Download(%+v) did not populate requested range", r)
+		}
+	}
+
+	target := ranges.Range{Pos: 1536 * 1024, Size: 250}
+	if err := dls.EnsureDownloader(target); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !item.HasRange(target) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !item.HasRange(target) {
+		t.Fatal("EnsureDownloader did not asynchronously populate requested range")
 	}
 }
 

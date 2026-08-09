@@ -12,9 +12,9 @@ import (
 // sourceObject adapts Source to the narrow object contract used by the cache engine.
 type sourceObject struct {
 	src source.Source
-	key string
 
 	mu      sync.RWMutex
+	key     string
 	meta    source.Metadata
 	headers map[string][]string
 }
@@ -25,21 +25,22 @@ func (o *sourceObject) Size() int64 {
 	return o.meta.Size
 }
 
-func (o *sourceObject) updateRequest(meta source.Metadata, headers map[string][]string) {
+func (o *sourceObject) updateRequest(key string, meta source.Metadata, headers map[string][]string) {
 	o.mu.Lock()
+	o.key = key
 	o.meta = meta
 	o.headers = cloneHeaderMap(headers)
 	o.mu.Unlock()
 }
 
-func (o *sourceObject) snapshotRequest() (source.Metadata, map[string][]string) {
+func (o *sourceObject) snapshotRequest() (string, source.Metadata, map[string][]string) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	return o.meta, cloneHeaderMap(o.headers)
+	return o.key, o.meta, cloneHeaderMap(o.headers)
 }
 
 func (o *sourceObject) Open(ctx context.Context, span *objectio.Span) (io.ReadCloser, error) {
-	meta, headers := o.snapshotRequest()
+	key, meta, headers := o.snapshotRequest()
 	start := int64(0)
 	end := meta.Size
 	if span != nil {
@@ -58,10 +59,14 @@ func (o *sourceObject) Open(ctx context.Context, span *objectio.Span) (io.ReadCl
 		return nil, source.ErrRangeNotSatisfiable
 	}
 	ctx = source.WithRequestHeaders(ctx, headers)
-	return o.src.OpenRange(ctx, o.key, start, end, meta)
+	return o.src.OpenRange(ctx, key, start, end, meta)
 }
 
-func (o *sourceObject) String() string { return o.key }
+func (o *sourceObject) String() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.key
+}
 
 func cloneHeaderMap(headers map[string][]string) map[string][]string {
 	if len(headers) == 0 {

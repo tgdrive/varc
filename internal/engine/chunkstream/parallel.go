@@ -47,7 +47,7 @@ func (cr *parallel) newStream(ctx context.Context, offset, size int64) (s *strea
 }
 
 func (s *stream) readFrom(ctx context.Context) {
-	rc, err := s.cr.o.Open(ctx, &objectio.Span{Start: s.offset, End: s.offset + s.size - 1})
+	rc, err := objectio.OpenRetrying(ctx, s.cr.o, &objectio.Span{Start: s.offset, End: s.offset + s.size - 1})
 	if err != nil {
 		s.err <- fmt.Errorf("parallel chunked reader: failed to open stream at %d size %d: %w", s.offset, s.size, err)
 		return

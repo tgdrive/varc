@@ -55,6 +55,7 @@ func TestParseBytes(t *testing.T) {
 func TestUnmarshalCaddyfile(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`varc https://origin.example/base {
 	cache_dir /var/cache/varc
+	key {host}:{uri}
 	max_size 10GiB
 	min_free_space 1GiB
 	shard_depth 2
@@ -75,6 +76,9 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	}
 	if h.Upstream != "https://origin.example/base" || h.CacheDir != "/var/cache/varc" {
 		t.Fatalf("unexpected base config: %+v", h)
+	}
+	if h.Key != "{host}:{uri}" {
+		t.Fatalf("key template = %q", h.Key)
 	}
 	if h.CacheMaxSize == nil || *h.CacheMaxSize != 10<<30 {
 		t.Fatalf("max size = %v", h.CacheMaxSize)
@@ -117,6 +121,34 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	}
 }
 
+func TestCacheKeyTemplate(t *testing.T) {
+	keyFunc := newCacheKeyFunc("{host}:{uri}")
+	req := httptest.NewRequest(http.MethodGet, "http://media.example/movie.bin?token=abc", nil)
+	got, err := keyFunc(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "media.example:/movie.bin?token=abc" {
+		t.Fatalf("cache key = %q", got)
+	}
+
+	keyFunc = newCacheKeyFunc("{http.request.header.X-Tenant}:{http.request.uri.path}")
+	req = httptest.NewRequest(http.MethodGet, "http://media.example/movie.bin?token=abc", nil)
+	req.Header.Set("X-Tenant", "acme")
+	got, err = keyFunc(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "acme:/movie.bin" {
+		t.Fatalf("full-placeholder cache key = %q", got)
+	}
+
+	keyFunc = newCacheKeyFunc("{does.not.exist}")
+	if _, err := keyFunc(req); err == nil {
+		t.Fatal("unknown placeholder unexpectedly succeeded")
+	}
+}
+
 func TestProvisionServeAndCleanup(t *testing.T) {
 	data := []byte("0123456789abcdef")
 	modTime := time.Date(2026, time.August, 9, 10, 0, 0, 0, time.UTC)
@@ -126,6 +158,10 @@ func TestProvisionServeAndCleanup(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Origin-Token"); got != "secret" {
 			http.Error(w, "missing origin token", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/objects/movie.bin" {
+			http.Error(w, "unexpected origin path", http.StatusBadRequest)
 			return
 		}
 		switch r.Method {
@@ -144,6 +180,7 @@ func TestProvisionServeAndCleanup(t *testing.T) {
 		Upstream: origin.URL + "/objects",
 		CacheDir: t.TempDir(),
 		Headers:  http.Header{"X-Origin-Token": []string{"secret"}},
+		Key:      "{host}:{uri}",
 	}
 	zero := caddy.Duration(0)
 	h.CachePollInterval = &zero
@@ -173,14 +210,24 @@ func TestProvisionServeAndCleanup(t *testing.T) {
 			t.Fatalf("response = %d %q", rr.Code, rr.Body.String())
 		}
 	}
+
+	otherHostReq := httptest.NewRequest(http.MethodGet, "http://cache-two.example/movie.bin", nil)
+	otherHostReq.Header.Set("Range", "bytes=2-5")
+	otherHostRR := httptest.NewRecorder()
+	if err := h.ServeHTTP(otherHostRR, otherHostReq, next); err != nil {
+		t.Fatal(err)
+	}
+	if otherHostRR.Code != http.StatusPartialContent || otherHostRR.Body.String() != "2345" {
+		t.Fatalf("different-host response = %d %q", otherHostRR.Code, otherHostRR.Body.String())
+	}
 	if nextCalled.Load() {
 		t.Fatal("GET unexpectedly continued to next handler")
 	}
-	if gets.Load() != 1 {
-		t.Fatalf("origin GETs = %d, want 1 cache fill", gets.Load())
+	if gets.Load() != 2 {
+		t.Fatalf("origin GETs = %d, want 2 cache fills for two host keys", gets.Load())
 	}
-	if heads.Load() != 2 {
-		t.Fatalf("origin HEADs = %d, want 2 metadata validations", heads.Load())
+	if heads.Load() != 3 {
+		t.Fatalf("origin HEADs = %d, want 3 metadata validations", heads.Load())
 	}
 
 	post := httptest.NewRequest(http.MethodPost, "http://cache.example/movie.bin", nil)

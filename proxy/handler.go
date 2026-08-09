@@ -15,13 +15,14 @@ import (
 	"varc/source"
 )
 
-// KeyFunc maps an incoming request to a source/cache key.
+// KeyFunc maps an incoming request to an object or cache key.
 type KeyFunc func(*http.Request) (string, error)
 
 // Handler serves source objects through Cache.
 type Handler struct {
-	Cache *cache.Cache
-	Key   KeyFunc
+	Cache    *cache.Cache
+	Key      KeyFunc // source object key; defaults to PathKey
+	CacheKey KeyFunc // cache identity; defaults to the source key
 }
 
 // PathKey uses the cleaned URL path without a leading slash as the cache key.
@@ -49,10 +50,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if keyFunc == nil {
 		keyFunc = PathKey
 	}
-	key, err := keyFunc(r)
+	sourceKey, err := keyFunc(r)
 	if err != nil {
 		http.Error(w, "invalid object key", http.StatusBadRequest)
 		return
+	}
+	cacheKey := sourceKey
+	if h.CacheKey != nil {
+		cacheKey, err = h.CacheKey(r)
+		if err != nil {
+			http.Error(w, "invalid cache key", http.StatusBadRequest)
+			return
+		}
 	}
 
 	headers := r.Header.Clone()
@@ -60,7 +69,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		headers.Set("Host", r.Host)
 	}
 	ctx := source.WithRequestHeaders(r.Context(), headers)
-	reader, err := h.Cache.Open(ctx, key)
+	reader, err := h.Cache.OpenWithCacheKey(ctx, sourceKey, cacheKey)
 	if err != nil {
 		h.serveError(w, err)
 		return
@@ -75,7 +84,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", meta.ETag)
 	}
 
-	name := path.Base(key)
+	name := path.Base(sourceKey)
 	content := &readSeeker{reader: reader, size: reader.Size()}
 	http.ServeContent(w, r, name, meta.LastModified, content)
 }

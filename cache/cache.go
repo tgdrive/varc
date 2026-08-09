@@ -15,6 +15,7 @@ import (
 	"time"
 
 	diskspace "varc/internal/engine/diskspace"
+	"varc/internal/engine/ioerrors"
 	"varc/internal/engine/objectio"
 	"varc/ranges"
 	"varc/source"
@@ -42,6 +43,7 @@ type Cache struct {
 	kick          chan struct{}
 	cleanerKicked bool
 	outOfSpace    bool
+	failedResets  map[string]error
 }
 
 // Stats is a point-in-time view of cache usage.
@@ -80,16 +82,17 @@ func New(ctx context.Context, dir string, src source.Source, opt Options) (*Cach
 	}
 
 	cacheCtx, cancel := context.WithCancel(ctx)
-	cacheCtx = objectio.WithConfig(cacheCtx, objectio.Config{BufferSize: opt.BufferSize})
+	cacheCtx = objectio.WithConfig(cacheCtx, objectio.Config{BufferSize: opt.BufferSize, LowLevelRetries: opt.LowLevelRetries})
 	c := &Cache{
-		ctx:    cacheCtx,
-		cancel: cancel,
-		src:    src,
-		opt:    opt,
-		root:   root,
-		data:   data,
-		meta:   meta,
-		items:  make(map[string]*Item),
+		ctx:          cacheCtx,
+		cancel:       cancel,
+		src:          src,
+		opt:          opt,
+		root:         root,
+		data:         data,
+		meta:         meta,
+		items:        make(map[string]*Item),
+		failedResets: make(map[string]error),
 	}
 	c.cond = sync.NewCond(&c.mu)
 	c.kick = make(chan struct{})
@@ -228,20 +231,30 @@ func (c *Cache) loadExistingMeta(metaPath string) (string, error) {
 }
 
 // Open validates key against the source and returns a reader backed by the
-// sparse local cache.
+// sparse local cache. The source key is also used as the cache identity.
 func (c *Cache) Open(ctx context.Context, key string) (*Reader, error) {
+	return c.OpenWithCacheKey(ctx, key, key)
+}
+
+// OpenWithCacheKey validates sourceKey against the source while storing and
+// reusing bytes under cacheKey. This lets HTTP integrations vary cache identity
+// independently from the origin object path.
+func (c *Cache) OpenWithCacheKey(ctx context.Context, sourceKey, cacheKey string) (*Reader, error) {
 	if ctx == nil {
 		return nil, errors.New("cache: nil open context")
 	}
-	if key == "" {
-		return nil, errors.New("cache: empty key")
+	if sourceKey == "" {
+		return nil, errors.New("cache: empty source key")
 	}
-	meta, err := c.src.Stat(ctx, key)
+	if cacheKey == "" {
+		return nil, errors.New("cache: empty cache key")
+	}
+	meta, err := c.src.Stat(ctx, sourceKey)
 	if err != nil {
-		return nil, fmt.Errorf("cache: stat %q: %w", key, err)
+		return nil, fmt.Errorf("cache: stat %q: %w", sourceKey, err)
 	}
 	if meta.Size < 0 {
-		return nil, fmt.Errorf("cache: source %q has unknown size", key)
+		return nil, fmt.Errorf("cache: source %q has unknown size", sourceKey)
 	}
 
 	c.mu.Lock()
@@ -249,17 +262,36 @@ func (c *Cache) Open(ctx context.Context, key string) (*Reader, error) {
 		c.mu.Unlock()
 		return nil, errors.New("cache: closed")
 	}
-	item := c.items[key]
+	item := c.items[cacheKey]
 	if item == nil {
-		item = newItem(c, key)
-		c.items[key] = item
+		item = newItem(c, cacheKey)
+		c.items[cacheKey] = item
 	}
 	item.mu.Lock()
 	c.mu.Unlock()
 
-	if err := item.openLocked(ctx, meta); err != nil {
+	var openErr error
+	for range c.opt.LowLevelRetries {
+		for item.beingReset {
+			item.cond.Wait()
+		}
+		item.pendingAccesses++
+		openErr = item.openLocked(ctx, sourceKey, meta)
+		item.pendingAccesses--
+		item.cond.Broadcast()
+		if openErr == nil {
+			break
+		}
+		if !ioerrors.IsNoSpace(openErr) && openErr.Error() != "no space left on device" {
+			break
+		}
 		item.mu.Unlock()
-		return nil, err
+		c.KickCleaner()
+		item.mu.Lock()
+	}
+	if openErr != nil {
+		item.mu.Unlock()
+		return nil, openErr
 	}
 	item.mu.Unlock()
 	return &Reader{ctx: ctx, item: item, meta: meta}, nil
@@ -333,6 +365,49 @@ func (c *Cache) removeUnused(item *Item) (bool, int64) {
 	return true, freed
 }
 
+func (c *Cache) haveQuotas() bool {
+	return c.opt.CacheMaxSize > 0 || c.opt.CacheMinFreeSpace > 0
+}
+
+func (c *Cache) rememberFailedReset(item *Item, err error) {
+	c.mu.Lock()
+	c.failedResets[item.key] = err
+	c.mu.Unlock()
+}
+
+func (c *Cache) retryFailedResets() {
+	type retry struct {
+		key  string
+		item *Item
+	}
+
+	c.mu.Lock()
+	retries := make([]retry, 0, len(c.failedResets))
+	for key := range c.failedResets {
+		item := c.items[key]
+		if item == nil {
+			delete(c.failedResets, key)
+			continue
+		}
+		retries = append(retries, retry{key: key, item: item})
+	}
+	c.mu.Unlock()
+
+	for _, retry := range retries {
+		removed, _, err := retry.item.resetForSpace()
+		c.mu.Lock()
+		if removed && c.items[retry.key] == retry.item {
+			delete(c.items, retry.key)
+		}
+		if err == nil || !ioerrors.IsNoSpace(err) {
+			delete(c.failedResets, retry.key)
+		} else {
+			c.failedResets[retry.key] = err
+		}
+		c.mu.Unlock()
+	}
+}
+
 func (c *Cache) clean(kicked bool) {
 	items, used := c.snapshotCandidates()
 	now := time.Now()
@@ -380,11 +455,14 @@ func (c *Cache) clean(kicked bool) {
 				continue
 			}
 			removed, freed, err := candidate.item.resetForSpace()
+			used -= freed
+			if freed > 0 {
+				candidate.size = 0
+			}
 			if err != nil {
+				c.rememberFailedReset(candidate.item, err)
 				continue
 			}
-			used -= freed
-			candidate.size = 0
 			if removed {
 				c.mu.Lock()
 				if c.items[candidate.item.key] == candidate.item {
@@ -395,6 +473,9 @@ func (c *Cache) clean(kicked bool) {
 		}
 	}
 
+	if c.haveQuotas() {
+		c.retryFailedResets()
+	}
 	if kicked {
 		c.kickerMu.Lock()
 		c.cleanerKicked = false

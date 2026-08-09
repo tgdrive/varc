@@ -151,6 +151,42 @@ func TestReadCachesSparseRange(t *testing.T) {
 	}
 }
 
+func TestOpenWithCacheKeySeparatesCacheIdentityFromSourceKey(t *testing.T) {
+	src := newMemorySource()
+	src.set("movie", "0123456789", `"v1"`)
+	opt := testOptions()
+	c := openTestCache(t, src, opt)
+
+	read := func(cacheKey string) {
+		t.Helper()
+		r, err := c.OpenWithCacheKey(context.Background(), "movie", cacheKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 2)
+		if n, err := r.ReadAt(buf, 0); err != nil || n != 2 || string(buf) != "01" {
+			t.Fatalf("ReadAt(%q) = %d, %v, %q", cacheKey, n, err, buf)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	read("tenant-a:movie")
+	read("tenant-b:movie")
+	if got := src.callCount(); got != 2 {
+		t.Fatalf("source calls after distinct cache keys = %d, want 2", got)
+	}
+	if got := src.lastCall(); got.key != "movie" {
+		t.Fatalf("source key = %q, want movie", got.key)
+	}
+
+	read("tenant-b:movie")
+	if got := src.callCount(); got != 2 {
+		t.Fatalf("source calls after repeated cache key = %d, want 2", got)
+	}
+}
+
 func TestReadAheadIsCached(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "0123456789", `"v1"`)
@@ -339,6 +375,232 @@ func TestCleanResetsOpenItemWhenOverQuota(t *testing.T) {
 	c.Clean()
 	if got := c.Stats(); got.Items != 0 || got.CachedBytes != 0 {
 		t.Fatalf("stats after clean = %+v", got)
+	}
+}
+
+func TestReadRecreatesMissingScheduler(t *testing.T) {
+	src := newMemorySource()
+	src.set("movie", "0123456789", `"v1"`)
+	opt := testOptions()
+	opt.ChunkSize = 4
+	opt.ChunkSizeLimit = 4
+	c := openTestCache(t, src, opt)
+
+	r, err := c.Open(context.Background(), "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	c.mu.Lock()
+	item := c.items["movie"]
+	c.mu.Unlock()
+	item.mu.Lock()
+	old := item.downloaders
+	item.downloaders = nil
+	item.mu.Unlock()
+	if old == nil {
+		t.Fatal("scheduler was not created on open")
+	}
+	if err := old.Close(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 2)
+	if _, err := r.ReadAt(buf, 0); err != nil || string(buf) != "01" {
+		t.Fatalf("ReadAt after scheduler removal = %v, %q", err, buf)
+	}
+	item.mu.Lock()
+	recreated := item.downloaders != nil
+	item.mu.Unlock()
+	if !recreated {
+		t.Fatal("scheduler was not recreated for a missing range")
+	}
+}
+
+func TestCleanRetriesRememberedResetAfterRangesCleared(t *testing.T) {
+	src := newMemorySource()
+	src.set("movie", "0123456789", `"v1"`)
+	opt := testOptions()
+	opt.CacheMaxSize = 1
+	c := openTestCache(t, src, opt)
+
+	r, err := c.Open(context.Background(), "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	c.mu.Lock()
+	item := c.items["movie"]
+	c.mu.Unlock()
+	item.mu.Lock()
+	item.info.Rs = nil
+	item.beingReset = true
+	item.mu.Unlock()
+	c.mu.Lock()
+	c.failedResets[item.key] = errors.New("remembered reset")
+	c.mu.Unlock()
+
+	c.Clean()
+
+	item.mu.Lock()
+	beingReset := item.beingReset
+	hasScheduler := item.downloaders != nil
+	hasFile := item.fd != nil
+	item.mu.Unlock()
+	if beingReset || !hasScheduler || !hasFile {
+		t.Fatalf("reset recovery = beingReset %v, scheduler %v, file %v", beingReset, hasScheduler, hasFile)
+	}
+	c.mu.Lock()
+	_, remembered := c.failedResets[item.key]
+	c.mu.Unlock()
+	if remembered {
+		t.Fatal("successful reset remained in failed-reset set")
+	}
+
+	buf := make([]byte, 2)
+	if _, err := r.ReadAt(buf, 0); err != nil || string(buf) != "01" {
+		t.Fatalf("ReadAt after reset recovery = %v, %q", err, buf)
+	}
+}
+
+func TestHandleCachingReusesOpenState(t *testing.T) {
+	src := newMemorySource()
+	src.set("movie", "0123456789", `"v1"`)
+	opt := testOptions()
+	opt.HandleCaching = 100 * time.Millisecond
+	c := openTestCache(t, src, opt)
+
+	r, err := c.Open(context.Background(), "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2)
+	if _, err := r.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	item := c.items["movie"]
+	c.mu.Unlock()
+	item.mu.Lock()
+	fd := item.fd
+	dls := item.downloaders
+	item.mu.Unlock()
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	item.mu.Lock()
+	if item.fd == nil || item.downloaders == nil || item.graceTimer == nil {
+		item.mu.Unlock()
+		t.Fatal("close did not retain file and scheduler during handle-caching grace")
+	}
+	item.mu.Unlock()
+
+	r, err = c.Open(context.Background(), "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.mu.Lock()
+	reused := item.fd == fd && item.downloaders == dls && item.graceTimer == nil
+	item.mu.Unlock()
+	if !reused {
+		t.Fatal("reopen during grace did not reuse file and scheduler")
+	}
+	if _, err := r.ReadAt(buf, 2); err != nil || string(buf) != "23" {
+		t.Fatalf("ReadAt after grace reopen = %v, %q", err, buf)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		item.mu.Lock()
+		closed := item.fd == nil && item.downloaders == nil && item.graceTimer == nil
+		item.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("file and scheduler remained alive after handle-caching grace")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestHandleCachingDisabledClosesImmediately(t *testing.T) {
+	src := newMemorySource()
+	src.set("movie", "0123456789", `"v1"`)
+	c := openTestCache(t, src, testOptions())
+
+	r, err := c.Open(context.Background(), "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	item := c.items["movie"]
+	c.mu.Unlock()
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	item.mu.Lock()
+	alive := item.fd != nil || item.downloaders != nil || item.graceTimer != nil
+	item.mu.Unlock()
+	if alive {
+		t.Fatal("disabled handle caching left file, scheduler, or timer alive")
+	}
+	if err := r.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("second Close = %v, want os.ErrClosed", err)
+	}
+}
+
+func TestCleanerSkipsHandleCachingGrace(t *testing.T) {
+	src := newMemorySource()
+	src.set("movie", "0123456789", `"v1"`)
+	opt := testOptions()
+	opt.CacheMaxSize = 1
+	opt.HandleCaching = 100 * time.Millisecond
+	c := openTestCache(t, src, opt)
+
+	r, err := c.Open(context.Background(), "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadAt(make([]byte, 2), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c.Clean()
+	if got := c.Stats(); got.Items != 1 || got.CachedBytes == 0 {
+		t.Fatalf("clean during grace = %+v", got)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.mu.Lock()
+		item := c.items["movie"]
+		c.mu.Unlock()
+		if item == nil {
+			break
+		}
+		item.mu.Lock()
+		graceDone := item.graceTimer == nil && item.fd == nil
+		item.mu.Unlock()
+		if graceDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("handle-caching grace did not expire")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.Clean()
+	if got := c.Stats(); got.Items != 0 || got.CachedBytes != 0 {
+		t.Fatalf("clean after grace = %+v", got)
 	}
 }
 

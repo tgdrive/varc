@@ -27,11 +27,12 @@ type Config struct {
 	BufferSize      int64
 	MaxBufferMemory int64
 	UseMmap         bool
+	LowLevelRetries int
 }
 
 type configKey struct{}
 
-var defaultConfig = Config{BufferSize: 16 * 1024 * 1024}
+var defaultConfig = Config{BufferSize: 16 * 1024 * 1024, LowLevelRetries: 10}
 
 // WithConfig attaches engine read settings to ctx.
 func WithConfig(ctx context.Context, cfg Config) context.Context {

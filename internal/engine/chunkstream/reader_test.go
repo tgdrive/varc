@@ -19,12 +19,18 @@ type openedRange struct {
 }
 
 type testObject struct {
-	data []byte
-	mu   sync.Mutex
-	open []openedRange
+	data    []byte
+	unknown bool
+	mu      sync.Mutex
+	open    []openedRange
 }
 
-func (o *testObject) Size() int64 { return int64(len(o.data)) }
+func (o *testObject) Size() int64 {
+	if o.unknown {
+		return -1
+	}
+	return int64(len(o.data))
+}
 
 func (o *testObject) Open(_ context.Context, span *objectio.Span) (io.ReadCloser, error) {
 	start := int64(0)
@@ -48,6 +54,88 @@ func (o *testObject) ranges() []openedRange {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]openedRange(nil), o.open...)
+}
+
+func TestReaderSelection(t *testing.T) {
+	const mib = 1024 * 1024
+	for _, test := range []struct {
+		name     string
+		initial  int64
+		limit    int64
+		streams  int
+		unknown  bool
+		parallel bool
+	}{
+		{name: "disabled_chunks", initial: -1, limit: mib},
+		{name: "sequential", initial: mib, limit: 10 * mib},
+		{name: "one_stream", initial: mib, limit: 10 * mib, streams: 1},
+		{name: "parallel", initial: mib, limit: 10 * mib, streams: 2, parallel: true},
+		{name: "unknown_parallel_falls_back", initial: mib, limit: 10 * mib, streams: 2, unknown: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := &testObject{data: []byte("hello"), unknown: test.unknown}
+			reader := New(context.Background(), o, test.initial, test.limit, test.streams)
+			_, isParallel := reader.(*parallel)
+			if isParallel != test.parallel {
+				t.Fatalf("parallel reader = %v, want %v", isParallel, test.parallel)
+			}
+			if err := reader.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestReadSeekMatrix(t *testing.T) {
+	content := make([]byte, 2049)
+	for i := range content {
+		content[i] = byte(i % 251)
+	}
+	chunkSizes := []int64{-1, 1, 16, 1025}
+	limits := []int64{-1, 1, 32, 1025}
+	offsets := []int64{0, 1, 15, 16, 17, 511, 512, 1023, 1024, 2048}
+	readLimits := []int64{-1, 0, 1, 32, 1025}
+
+	for _, streams := range []int{0, 3} {
+		for _, chunkSize := range chunkSizes {
+			for _, limit := range limits {
+				name := fmt.Sprintf("streams_%d_chunk_%d_limit_%d", streams, chunkSize, limit)
+				t.Run(name, func(t *testing.T) {
+					reader := New(context.Background(), &testObject{data: content}, chunkSize, limit, streams)
+					defer reader.Close()
+					for _, offset := range offsets {
+						for _, readLimit := range readLimits {
+							gotOffset, err := reader.RangeSeek(context.Background(), offset, io.SeekStart, readLimit)
+							if err != nil {
+								t.Fatalf("RangeSeek(%d,%d): %v", offset, readLimit, err)
+							}
+							if gotOffset != offset {
+								t.Fatalf("RangeSeek(%d,%d) = %d", offset, readLimit, gotOffset)
+							}
+							buf := make([]byte, 32)
+							n, readErr := reader.Read(buf)
+							end := offset + int64(len(buf))
+							if end > int64(len(content)) {
+								end = int64(len(content))
+							}
+							if n != int(end-offset) {
+								t.Fatalf("Read at %d = %d, want %d", offset, n, end-offset)
+							}
+							if !bytes.Equal(buf[:n], content[offset:end]) {
+								t.Fatalf("Read at %d returned wrong data", offset)
+							}
+							if n < len(buf) && readErr != io.EOF {
+								t.Fatalf("Read at %d error = %v, want EOF", offset, readErr)
+							}
+							if n == len(buf) && readErr != nil {
+								t.Fatalf("Read at %d error = %v", offset, readErr)
+							}
+						}
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestSequentialChunkGrowth(t *testing.T) {
