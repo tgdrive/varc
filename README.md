@@ -94,7 +94,7 @@ For parallel range fetching, set `ChunkStreams` above 1. For sequential adaptive
 
 ## Go usage
 
-The module path is currently local (`varc`) until a public repository/import path is chosen.
+The module path is `github.com/tgdrive/varc`.
 
 ```go
 src := httpsource.New(http.DefaultClient, func(ctx context.Context, key string) (string, error) {
@@ -155,7 +155,15 @@ The directive is ordered before `reverse_proxy`. GET and HEAD requests are serve
 
 The Caddy adapter provisions one cache instance for a config load and closes it during Caddy cleanup/reload.
 
-When the module has a public import path, a custom Caddy build can include the nested module with `xcaddy build --with <module-path>/caddy`.
+Build Caddy with the module directly from GitHub:
+
+```text
+xcaddy build v2.11.3 \
+    --with github.com/tgdrive/varc/caddy@main \
+    --replace github.com/tgdrive/varc=github.com/tgdrive/varc@main
+```
+
+This downloads both modules from GitHub and does not use a local checkout. After versioned releases exist, the remote replacement can be removed; a release must publish both the root tag (for example, `v0.1.0`) and the matching nested-module tag (`caddy/v0.1.0`).
 
 ## Validation
 

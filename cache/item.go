@@ -14,11 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"varc/internal/engine/ioerrors"
-	"varc/internal/engine/scheduler"
-	"varc/internal/engine/sparsefile"
-	"varc/ranges"
-	"varc/source"
+	"github.com/tgdrive/varc/internal/engine/ioerrors"
+	"github.com/tgdrive/varc/internal/engine/scheduler"
+	"github.com/tgdrive/varc/internal/engine/sparsefile"
+	"github.com/tgdrive/varc/ranges"
+	"github.com/tgdrive/varc/source"
 )
 
 type itemInfo struct {

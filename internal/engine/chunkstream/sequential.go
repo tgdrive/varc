@@ -5,7 +5,7 @@ import (
 	"io"
 	"sync"
 
-	"varc/internal/engine/objectio"
+	"github.com/tgdrive/varc/internal/engine/objectio"
 )
 
 type sequential struct {

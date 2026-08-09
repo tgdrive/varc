@@ -7,9 +7,9 @@ import (
 	"io"
 	"sync"
 
-	"varc/internal/engine/bufferpool"
-	"varc/internal/engine/objectio"
-	"varc/internal/engine/readutil"
+	"github.com/tgdrive/varc/internal/engine/bufferpool"
+	"github.com/tgdrive/varc/internal/engine/objectio"
+	"github.com/tgdrive/varc/internal/engine/readutil"
 )
 
 const (

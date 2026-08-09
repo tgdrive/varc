@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"varc/internal/engine/chunkstream"
-	"varc/internal/engine/ioerrors"
-	"varc/internal/engine/objectio"
-	"varc/internal/engine/streambuf"
-	"varc/ranges"
+	"github.com/tgdrive/varc/internal/engine/chunkstream"
+	"github.com/tgdrive/varc/internal/engine/ioerrors"
+	"github.com/tgdrive/varc/internal/engine/objectio"
+	"github.com/tgdrive/varc/internal/engine/streambuf"
+	"github.com/tgdrive/varc/ranges"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"varc/source"
+	"github.com/tgdrive/varc/source"
 )
 
 // Resolver maps a cache key to an upstream URL.

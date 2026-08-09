@@ -15,9 +15,9 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 
-	"varc/cache"
-	"varc/proxy"
-	httpsource "varc/source/http"
+	"github.com/tgdrive/varc/cache"
+	"github.com/tgdrive/varc/proxy"
+	httpsource "github.com/tgdrive/varc/source/http"
 )
 
 func init() {

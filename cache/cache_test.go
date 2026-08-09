@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	diskspace "varc/internal/engine/diskspace"
-	"varc/source"
+	diskspace "github.com/tgdrive/varc/internal/engine/diskspace"
+	"github.com/tgdrive/varc/source"
 )
 
 type rangeCall struct {

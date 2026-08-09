@@ -5,8 +5,8 @@ import (
 	"io"
 	"sync"
 
-	"varc/internal/engine/objectio"
-	"varc/source"
+	"github.com/tgdrive/varc/internal/engine/objectio"
+	"github.com/tgdrive/varc/source"
 )
 
 // sourceObject adapts Source to the narrow object contract used by the cache engine.

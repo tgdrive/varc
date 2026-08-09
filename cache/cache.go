@@ -14,11 +14,11 @@ import (
 	"sync"
 	"time"
 
-	diskspace "varc/internal/engine/diskspace"
-	"varc/internal/engine/ioerrors"
-	"varc/internal/engine/objectio"
-	"varc/ranges"
-	"varc/source"
+	diskspace "github.com/tgdrive/varc/internal/engine/diskspace"
+	"github.com/tgdrive/varc/internal/engine/ioerrors"
+	"github.com/tgdrive/varc/internal/engine/objectio"
+	"github.com/tgdrive/varc/ranges"
+	"github.com/tgdrive/varc/source"
 )
 
 // Cache owns cached objects and the background eviction loop.

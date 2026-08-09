@@ -1,4 +1,4 @@
-module varc/caddy
+module github.com/tgdrive/varc/caddy
 
 go 1.25.0
 
@@ -94,6 +94,7 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
 	github.com/tailscale/tscert v0.0.0-20251216020129-aea342f6d747 // indirect
+	github.com/tgdrive/varc v0.0.0
 	github.com/urfave/cli v1.22.17 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
@@ -146,7 +147,6 @@ require (
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.5.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	howett.net/plist v1.0.0 // indirect
-	varc v0.0.0
 )
 
-replace varc => ..
+replace github.com/tgdrive/varc => ..

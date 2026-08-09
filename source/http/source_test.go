@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"varc/source"
+	"github.com/tgdrive/varc/source"
 )
 
 func resolverFor(server *httptest.Server) Resolver {

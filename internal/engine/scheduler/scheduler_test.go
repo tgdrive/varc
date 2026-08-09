@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"varc/internal/engine/objectio"
-	"varc/ranges"
+	"github.com/tgdrive/varc/internal/engine/objectio"
+	"github.com/tgdrive/varc/ranges"
 )
 
 type downloaderTestItem struct {

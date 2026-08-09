@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 
-	"varc/internal/engine/objectio"
+	"github.com/tgdrive/varc/internal/engine/objectio"
 )
 
 var (

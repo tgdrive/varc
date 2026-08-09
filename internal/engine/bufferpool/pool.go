@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
+	mapbuffer "github.com/tgdrive/varc/internal/engine/mapbuffer"
+	"github.com/tgdrive/varc/internal/engine/objectio"
 	"golang.org/x/sync/semaphore"
-	mapbuffer "varc/internal/engine/mapbuffer"
-	"varc/internal/engine/objectio"
 )
 
 const (

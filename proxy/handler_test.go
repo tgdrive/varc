@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"varc/cache"
-	httpsource "varc/source/http"
+	"github.com/tgdrive/varc/cache"
+	httpsource "github.com/tgdrive/varc/source/http"
 )
 
 type upstreamFixture struct {

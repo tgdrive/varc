@@ -1,4 +1,4 @@
-module varc
+module github.com/tgdrive/varc
 
 go 1.25.0
 

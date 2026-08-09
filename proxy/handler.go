@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"varc/cache"
-	"varc/source"
+	"github.com/tgdrive/varc/cache"
+	"github.com/tgdrive/varc/source"
 )
 
 // KeyFunc maps an incoming request to an object or cache key.
