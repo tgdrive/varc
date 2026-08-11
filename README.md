@@ -8,13 +8,13 @@
 net/http or Caddy
        |
        v
-  proxy.Handler
-       |
-       v
-   cache.Cache ------> source.Source
-       |                    |
-       |                    v
-       |               HTTP source
+  proxy.Handler ------> source.Source
+       |                      |
+       |                      v
+       |                 source.Object
+       |                      |
+       v                      v
+   cache.Cache <--------------+
        v
  sparse cache file + persisted range metadata
        |
@@ -96,26 +96,55 @@ For parallel range fetching, set `ChunkStreams` above 1. For sequential adaptive
 
 The module path is `github.com/tgdrive/varc`.
 
-```go
-src := httpsource.New(http.DefaultClient, func(ctx context.Context, key string) (string, error) {
-    return "https://origin.example/" + url.PathEscape(key), nil
-})
+Create one long-lived cache, resolve an origin object, and open it under a cache key:
 
+```go
 opt := cache.DefaultOptions()
 opt.ReadAhead = 8 << 20
 opt.ChunkStreams = 3
 
-c, err := cache.New(context.Background(), "/var/cache/varc", src, opt)
+ctx := context.Background()
+c, err := cache.New(ctx, "/var/cache/varc", opt)
 if err != nil {
     log.Fatal(err)
 }
 defer c.Close()
 
-handler := &proxy.Handler{Cache: c}
+src := httpsource.New(http.DefaultClient, func(ctx context.Context, key string) (string, error) {
+    return "https://origin.example/" + url.PathEscape(key), nil
+})
+object, err := src.Open(ctx, "movie.mp4")
+if err != nil {
+    log.Fatal(err)
+}
+reader, err := c.Open(ctx, "movie.mp4", object)
+if err != nil {
+    log.Fatal(err)
+}
+defer reader.Close()
+
+_, err = io.Copy(destination, reader)
+```
+
+`*cache.Reader` implements `io.Reader`, `io.ReaderAt`, and `io.Closer`. Sequential and positional reads share cached bytes, but `ReadAt` does not change the sequential offset.
+
+Origins implement the backend-independent object contract:
+
+```go
+type Object interface {
+    Metadata() source.Metadata
+    OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error)
+}
+```
+
+For an HTTP server, let the proxy resolve objects:
+
+```go
+handler := &proxy.Handler{Cache: c, Source: src}
 log.Fatal(http.ListenAndServe(":8080", handler))
 ```
 
-Incoming HTTP headers such as `Authorization`, `Cookie`, `Host`, tenant headers, and custom headers are forwarded to the origin for metadata and range requests. By default, cache identity is the object key, so different credentials for the same key share the same cached file. Embedders can override only the cache identity with `proxy.Handler.CacheKey` or call `Cache.OpenWithCacheKey` directly without changing the source object key.
+Incoming HTTP headers such as `Authorization`, `Cookie`, `Host`, tenant headers, and custom headers are captured when the source opens an object and forwarded for metadata and range requests. By default, cache identity is the object key, so different credentials for the same key share the same cached file. Embedders can override cache identity with `proxy.Handler.CacheKey` without changing the source object key.
 
 The cache owns representation-control headers. Client `Range`, `If-Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` values are removed from internal metadata requests, and cache-generated `Range` / `If-Range` values are used for range fetches. Static headers configured on `source/http.Source` override same-named incoming headers.
 

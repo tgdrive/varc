@@ -155,12 +155,12 @@ func (h *Handler) provision(ctx context.Context) error {
 		opt.LowLevelRetries = *h.LowLevelRetries
 	}
 
-	c, err := cache.New(ctx, h.CacheDir, src, opt)
+	c, err := cache.New(ctx, h.CacheDir, opt)
 	if err != nil {
 		return fmt.Errorf("varc: initialize cache: %w", err)
 	}
 	h.cache = c
-	h.handler = &proxy.Handler{Cache: c, Key: sourceKey}
+	h.handler = &proxy.Handler{Cache: c, Source: src, Key: sourceKey}
 	if dynamicUpstream {
 		h.handler.CacheKey = func(r *http.Request) (string, error) {
 			resolved, err := sourceKey(r)

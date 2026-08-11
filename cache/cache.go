@@ -25,7 +25,6 @@ import (
 type Cache struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	src    source.Source
 	opt    Options
 	root   string
 	data   string
@@ -54,12 +53,9 @@ type Stats struct {
 }
 
 // New creates a standalone read cache rooted at dir.
-func New(ctx context.Context, dir string, src source.Source, opt Options) (*Cache, error) {
+func New(ctx context.Context, dir string, opt Options) (*Cache, error) {
 	if ctx == nil {
 		return nil, errors.New("cache: nil context")
-	}
-	if src == nil {
-		return nil, errors.New("cache: nil source")
 	}
 	if dir == "" {
 		return nil, errors.New("cache: empty cache directory")
@@ -86,7 +82,6 @@ func New(ctx context.Context, dir string, src source.Source, opt Options) (*Cach
 	c := &Cache{
 		ctx:          cacheCtx,
 		cancel:       cancel,
-		src:          src,
 		opt:          opt,
 		root:         root,
 		data:         data,
@@ -230,31 +225,22 @@ func (c *Cache) loadExistingMeta(metaPath string) (string, error) {
 	return actualDataPath, nil
 }
 
-// Open validates key against the source and returns a reader backed by the
-// sparse local cache. The source key is also used as the cache identity.
-func (c *Cache) Open(ctx context.Context, key string) (*Reader, error) {
-	return c.OpenWithCacheKey(ctx, key, key)
-}
-
-// OpenWithCacheKey validates sourceKey against the source while storing and
-// reusing bytes under cacheKey. This lets HTTP integrations vary cache identity
-// independently from the origin object path.
-func (c *Cache) OpenWithCacheKey(ctx context.Context, sourceKey, cacheKey string) (*Reader, error) {
+// Open returns a reader for object backed by the sparse local cache. cacheKey
+// identifies the cached representation and must uniquely identify the object
+// for the lifetime of its metadata validators.
+func (c *Cache) Open(ctx context.Context, cacheKey string, object source.Object) (*Reader, error) {
 	if ctx == nil {
 		return nil, errors.New("cache: nil open context")
-	}
-	if sourceKey == "" {
-		return nil, errors.New("cache: empty source key")
 	}
 	if cacheKey == "" {
 		return nil, errors.New("cache: empty cache key")
 	}
-	meta, err := c.src.Stat(ctx, sourceKey)
-	if err != nil {
-		return nil, fmt.Errorf("cache: stat %q: %w", sourceKey, err)
+	if object == nil {
+		return nil, errors.New("cache: nil object")
 	}
+	meta := object.Metadata()
 	if meta.Size < 0 {
-		return nil, fmt.Errorf("cache: source %q has unknown size", sourceKey)
+		return nil, fmt.Errorf("cache: object %q has unknown size", cacheKey)
 	}
 
 	c.mu.Lock()
@@ -276,7 +262,7 @@ func (c *Cache) OpenWithCacheKey(ctx context.Context, sourceKey, cacheKey string
 			item.cond.Wait()
 		}
 		item.pendingAccesses++
-		openErr = item.openLocked(ctx, sourceKey, meta)
+		openErr = item.openLocked(object, meta)
 		item.pendingAccesses--
 		item.cond.Broadcast()
 		if openErr == nil {

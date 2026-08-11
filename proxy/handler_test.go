@@ -92,7 +92,7 @@ func newHTTPProxy(t *testing.T) (*Handler, *upstreamFixture) {
 	opt := cache.DefaultOptions()
 	opt.CachePollInterval = 0
 	opt.HandleCaching = 0
-	c, err := cache.New(context.Background(), t.TempDir(), src, opt)
+	c, err := cache.New(context.Background(), t.TempDir(), opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func newHTTPProxy(t *testing.T) (*Handler, *upstreamFixture) {
 			t.Errorf("cache Close: %v", err)
 		}
 	})
-	return &Handler{Cache: c}, fixture
+	return &Handler{Cache: c, Source: src}, fixture
 }
 
 func TestHandlerServesRangeAndThenCacheHitAcrossDifferentAuthHeaders(t *testing.T) {

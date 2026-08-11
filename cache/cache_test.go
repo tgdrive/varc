@@ -31,6 +31,12 @@ type memorySource struct {
 	startOne sync.Once
 }
 
+type memoryObject struct {
+	source *memorySource
+	key    string
+	meta   source.Metadata
+}
+
 func newMemorySource() *memorySource {
 	return &memorySource{
 		objects:  make(map[string][]byte),
@@ -45,17 +51,22 @@ func (s *memorySource) set(key string, data string, etag string) {
 	s.metadata[key] = source.Metadata{Size: int64(len(data)), ETag: etag, ContentType: "application/octet-stream"}
 }
 
-func (s *memorySource) Stat(_ context.Context, key string) (source.Metadata, error) {
+func (s *memorySource) Open(_ context.Context, key string) (source.Object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	meta, ok := s.metadata[key]
 	if !ok {
-		return source.Metadata{}, source.ErrNotFound
+		return nil, source.ErrNotFound
 	}
-	return meta, nil
+	return &memoryObject{source: s, key: key, meta: meta}, nil
 }
 
-func (s *memorySource) OpenRange(ctx context.Context, key string, start, end int64, expected source.Metadata) (io.ReadCloser, error) {
+func (o *memoryObject) Metadata() source.Metadata { return o.meta }
+
+func (o *memoryObject) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
+	s := o.source
+	key := o.key
+	expected := o.meta
 	s.mu.Lock()
 	s.calls = append(s.calls, rangeCall{key: key, start: start, end: end})
 	if len(s.failures) != 0 {
@@ -111,9 +122,9 @@ func testOptions() Options {
 	return opt
 }
 
-func openTestCache(t *testing.T, src source.Source, opt Options) *Cache {
+func openTestCache(t *testing.T, opt Options) *Cache {
 	t.Helper()
-	c, err := New(context.Background(), t.TempDir(), src, opt)
+	c, err := New(context.Background(), t.TempDir(), opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,12 +136,20 @@ func openTestCache(t *testing.T, src source.Source, opt Options) *Cache {
 	return c
 }
 
+func openTestObject(c *Cache, src source.Source, key string) (*Reader, error) {
+	object, err := src.Open(context.Background(), key)
+	if err != nil {
+		return nil, err
+	}
+	return c.Open(context.Background(), key, object)
+}
+
 func TestReadCachesSparseRange(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "0123456789", `"v1"`)
-	c := openTestCache(t, src, testOptions())
+	c := openTestCache(t, testOptions())
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,15 +170,19 @@ func TestReadCachesSparseRange(t *testing.T) {
 	}
 }
 
-func TestOpenWithCacheKeySeparatesCacheIdentityFromSourceKey(t *testing.T) {
+func TestOpenUsesCacheKeyIndependentlyFromObject(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
-	c := openTestCache(t, src, opt)
+	c := openTestCache(t, opt)
 
 	read := func(cacheKey string) {
 		t.Helper()
-		r, err := c.OpenWithCacheKey(context.Background(), "movie", cacheKey)
+		object, err := src.Open(context.Background(), "movie")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := c.Open(context.Background(), cacheKey, object)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -192,9 +215,9 @@ func TestReadAheadIsCached(t *testing.T) {
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
 	opt.ReadAhead = 3
-	c := openTestCache(t, src, opt)
+	c := openTestCache(t, opt)
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,14 +245,14 @@ func TestConcurrentOverlappingReadsShareFetch(t *testing.T) {
 	gate := make(chan struct{})
 	src.gate = gate
 	src.started = make(chan struct{})
-	c := openTestCache(t, src, testOptions())
+	c := openTestCache(t, testOptions())
 
-	r1, err := c.Open(context.Background(), "movie")
+	r1, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r1.Close()
-	r2, err := c.Open(context.Background(), "movie")
+	r2, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,11 +296,11 @@ func TestCachePersistsRangesAcrossRestart(t *testing.T) {
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
 
-	c1, err := New(context.Background(), dir, src, opt)
+	c1, err := New(context.Background(), dir, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := c1.Open(context.Background(), "movie")
+	r, err := openTestObject(c1, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +315,7 @@ func TestCachePersistsRangesAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c2, err := New(context.Background(), dir, src, opt)
+	c2, err := New(context.Background(), dir, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +323,7 @@ func TestCachePersistsRangesAcrossRestart(t *testing.T) {
 	if got := c2.Stats(); got.Items != 1 || got.CachedBytes != 8 || got.OpenItems != 0 {
 		t.Fatalf("stats immediately after restart = %+v, want one loaded 8-byte cached item", got)
 	}
-	r, err = c2.Open(context.Background(), "movie")
+	r, err = openTestObject(c2, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,9 +339,9 @@ func TestCachePersistsRangesAcrossRestart(t *testing.T) {
 func TestObjectChangeInvalidatesCachedRanges(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "abcdefghij", `"v1"`)
-	c := openTestCache(t, src, testOptions())
+	c := openTestCache(t, testOptions())
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +354,7 @@ func TestObjectChangeInvalidatesCachedRanges(t *testing.T) {
 	}
 
 	src.set("movie", "ABCDEFGHIJ", `"v2"`)
-	r, err = c.Open(context.Background(), "movie")
+	r, err = openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,9 +375,9 @@ func TestCleanResetsOpenItemWhenOverQuota(t *testing.T) {
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
 	opt.CacheMaxSize = 1
-	c := openTestCache(t, src, opt)
+	c := openTestCache(t, opt)
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,9 +407,9 @@ func TestReadRecreatesMissingScheduler(t *testing.T) {
 	opt := testOptions()
 	opt.ChunkSize = 4
 	opt.ChunkSizeLimit = 4
-	c := openTestCache(t, src, opt)
+	c := openTestCache(t, opt)
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,9 +446,9 @@ func TestCleanRetriesRememberedResetAfterRangesCleared(t *testing.T) {
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
 	opt.CacheMaxSize = 1
-	c := openTestCache(t, src, opt)
+	c := openTestCache(t, opt)
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,9 +493,9 @@ func TestHandleCachingReusesOpenState(t *testing.T) {
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
 	opt.HandleCaching = 100 * time.Millisecond
-	c := openTestCache(t, src, opt)
+	c := openTestCache(t, opt)
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +521,7 @@ func TestHandleCachingReusesOpenState(t *testing.T) {
 	}
 	item.mu.Unlock()
 
-	r, err = c.Open(context.Background(), "movie")
+	r, err = openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,9 +556,9 @@ func TestHandleCachingReusesOpenState(t *testing.T) {
 func TestHandleCachingDisabledClosesImmediately(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "0123456789", `"v1"`)
-	c := openTestCache(t, src, testOptions())
+	c := openTestCache(t, testOptions())
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,9 +585,9 @@ func TestCleanerSkipsHandleCachingGrace(t *testing.T) {
 	opt := testOptions()
 	opt.CacheMaxSize = 1
 	opt.HandleCaching = 100 * time.Millisecond
-	c := openTestCache(t, src, opt)
+	c := openTestCache(t, opt)
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,13 +645,13 @@ func TestMinFreeSpaceQuotaEvictsCache(t *testing.T) {
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
 	opt.CacheMinFreeSpace = int64(du.Total + 1)
-	c, err := New(context.Background(), dir, src, opt)
+	c, err := New(context.Background(), dir, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,11 +673,11 @@ func TestCorruptMetadataNeverTrustsExistingSparseFile(t *testing.T) {
 	src.set("movie", "0123456789", `"v1"`)
 	opt := testOptions()
 
-	c1, err := New(context.Background(), dir, src, opt)
+	c1, err := New(context.Background(), dir, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := c1.Open(context.Background(), "movie")
+	r, err := openTestObject(c1, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,12 +696,12 @@ func TestCorruptMetadataNeverTrustsExistingSparseFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c2, err := New(context.Background(), dir, src, opt)
+	c2, err := New(context.Background(), dir, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c2.Close()
-	r, err = c2.Open(context.Background(), "movie")
+	r, err = openTestObject(c2, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,8 +717,8 @@ func TestCorruptMetadataNeverTrustsExistingSparseFile(t *testing.T) {
 func TestReadAtClipsAtEOF(t *testing.T) {
 	src := newMemorySource()
 	src.set("short", "abcde", `"v1"`)
-	c := openTestCache(t, src, testOptions())
-	r, err := c.Open(context.Background(), "short")
+	c := openTestCache(t, testOptions())
+	r, err := openTestObject(c, src, "short")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -708,12 +731,44 @@ func TestReadAtClipsAtEOF(t *testing.T) {
 	}
 }
 
+func TestReaderSupportsSequentialAndPositionalReads(t *testing.T) {
+	src := newMemorySource()
+	src.set("movie", "0123456789", `"v1"`)
+	c := openTestCache(t, testOptions())
+	r, err := openTestObject(c, src, "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	first := make([]byte, 3)
+	if n, err := r.Read(first); err != nil || n != 3 || string(first) != "012" {
+		t.Fatalf("first Read = %d, %v, %q; want 3, nil, 012", n, err, first)
+	}
+
+	at := make([]byte, 2)
+	if n, err := r.ReadAt(at, 7); err != nil || n != 2 || string(at) != "78" {
+		t.Fatalf("ReadAt = %d, %v, %q; want 2, nil, 78", n, err, at)
+	}
+
+	rest, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rest) != "3456789" {
+		t.Fatalf("remaining body = %q, want 3456789", rest)
+	}
+	if n, err := r.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after EOF = %d, %v; want 0, EOF", n, err)
+	}
+}
+
 func TestDownloaderRestartsAfterRangeFailures(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "0123456789", `"v1"`)
 	src.failures = []error{errors.New("temporary 1"), errors.New("temporary 2")}
-	c := openTestCache(t, src, testOptions())
-	r, err := c.Open(context.Background(), "movie")
+	c := openTestCache(t, testOptions())
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,8 +787,8 @@ func TestDownloaderRestartsAfterObjectChangedError(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "0123456789", `"v1"`)
 	src.failures = []error{source.ErrObjectChanged}
-	c := openTestCache(t, src, testOptions())
-	r, err := c.Open(context.Background(), "movie")
+	c := openTestCache(t, testOptions())
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,7 +805,7 @@ func TestDownloaderRestartsAfterObjectChangedError(t *testing.T) {
 func TestCloseIsIdempotentAndRejectsNewOpens(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "0123456789", `"v1"`)
-	c, err := New(context.Background(), t.TempDir(), src, testOptions())
+	c, err := New(context.Background(), t.TempDir(), testOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,7 +815,7 @@ func TestCloseIsIdempotentAndRejectsNewOpens(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Open(context.Background(), "movie"); err == nil {
+	if _, err := openTestObject(c, src, "movie"); err == nil {
 		t.Fatal("expected Open after Close to fail")
 	}
 }
@@ -768,9 +823,9 @@ func TestCloseIsIdempotentAndRejectsNewOpens(t *testing.T) {
 func TestUnvalidatedMetadataIsNotReusedAcrossOpens(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "AAAA", "")
-	c := openTestCache(t, src, testOptions())
+	c := openTestCache(t, testOptions())
 
-	r, err := c.Open(context.Background(), "movie")
+	r, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +838,7 @@ func TestUnvalidatedMetadataIsNotReusedAcrossOpens(t *testing.T) {
 	}
 
 	src.set("movie", "BBBB", "")
-	r, err = c.Open(context.Background(), "movie")
+	r, err = openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,9 +857,9 @@ func TestUnvalidatedMetadataIsNotReusedAcrossOpens(t *testing.T) {
 func TestActiveReaderPreventsVersionSwap(t *testing.T) {
 	src := newMemorySource()
 	src.set("movie", "abcdefghij", `"v1"`)
-	c := openTestCache(t, src, testOptions())
+	c := openTestCache(t, testOptions())
 
-	first, err := c.Open(context.Background(), "movie")
+	first, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -814,14 +869,14 @@ func TestActiveReaderPreventsVersionSwap(t *testing.T) {
 	}
 
 	src.set("movie", "ABCDEFGHIJ", `"v2"`)
-	if _, err := c.Open(context.Background(), "movie"); !errors.Is(err, source.ErrObjectChanged) {
+	if _, err := openTestObject(c, src, "movie"); !errors.Is(err, source.ErrObjectChanged) {
 		t.Fatalf("second open error = %v, want ErrObjectChanged while old reader is active", err)
 	}
 
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	second, err := c.Open(context.Background(), "movie")
+	second, err := openTestObject(c, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,11 +929,11 @@ func TestShardDepthMigrationPreservesCachedRanges(t *testing.T) {
 
 	opt := testOptions()
 	opt.CacheShardDepth = 1
-	c1, err := New(context.Background(), dir, src, opt)
+	c1, err := New(context.Background(), dir, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r1, err := c1.Open(context.Background(), "movie")
+	r1, err := openTestObject(c1, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -896,7 +951,7 @@ func TestShardDepthMigrationPreservesCachedRanges(t *testing.T) {
 	}
 
 	opt.CacheShardDepth = 2
-	c2, err := New(context.Background(), dir, src, opt)
+	c2, err := New(context.Background(), dir, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -918,7 +973,7 @@ func TestShardDepthMigrationPreservesCachedRanges(t *testing.T) {
 		t.Fatalf("new metadata path: %v", err)
 	}
 
-	r2, err := c2.Open(context.Background(), "movie")
+	r2, err := openTestObject(c2, src, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}

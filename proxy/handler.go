@@ -21,6 +21,7 @@ type KeyFunc func(*http.Request) (string, error)
 // Handler serves source objects through Cache.
 type Handler struct {
 	Cache    *cache.Cache
+	Source   source.Source
 	Key      KeyFunc // source object key; defaults to PathKey
 	CacheKey KeyFunc // cache identity; defaults to the source key
 }
@@ -39,6 +40,10 @@ func PathKey(r *http.Request) (string, error) {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Cache == nil {
 		http.Error(w, "cache proxy is not configured", http.StatusInternalServerError)
+		return
+	}
+	if h.Source == nil {
+		http.Error(w, "cache source is not configured", http.StatusInternalServerError)
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -69,7 +74,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		headers.Set("Host", r.Host)
 	}
 	ctx := source.WithRequestHeaders(r.Context(), headers)
-	reader, err := h.Cache.OpenWithCacheKey(ctx, sourceKey, cacheKey)
+	object, err := h.Source.Open(ctx, sourceKey)
+	if err != nil {
+		h.serveError(w, err)
+		return
+	}
+	reader, err := h.Cache.Open(ctx, cacheKey, object)
 	if err != nil {
 		h.serveError(w, err)
 		return

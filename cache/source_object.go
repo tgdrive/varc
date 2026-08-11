@@ -9,14 +9,11 @@ import (
 	"github.com/tgdrive/varc/source"
 )
 
-// sourceObject adapts Source to the narrow object contract used by the cache engine.
+// sourceObject adapts an origin object to the cache engine's range contract.
 type sourceObject struct {
-	src source.Source
-
-	mu      sync.RWMutex
-	key     string
-	meta    source.Metadata
-	headers map[string][]string
+	mu     sync.RWMutex
+	origin source.Object
+	meta   source.Metadata
 }
 
 func (o *sourceObject) Size() int64 {
@@ -25,22 +22,21 @@ func (o *sourceObject) Size() int64 {
 	return o.meta.Size
 }
 
-func (o *sourceObject) updateRequest(key string, meta source.Metadata, headers map[string][]string) {
+func (o *sourceObject) update(origin source.Object, meta source.Metadata) {
 	o.mu.Lock()
-	o.key = key
+	o.origin = origin
 	o.meta = meta
-	o.headers = cloneHeaderMap(headers)
 	o.mu.Unlock()
 }
 
-func (o *sourceObject) snapshotRequest() (string, source.Metadata, map[string][]string) {
+func (o *sourceObject) snapshot() (source.Object, source.Metadata) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	return o.key, o.meta, cloneHeaderMap(o.headers)
+	return o.origin, o.meta
 }
 
 func (o *sourceObject) Open(ctx context.Context, span *objectio.Span) (io.ReadCloser, error) {
-	key, meta, headers := o.snapshotRequest()
+	origin, meta := o.snapshot()
 	start := int64(0)
 	end := meta.Size
 	if span != nil {
@@ -58,25 +54,11 @@ func (o *sourceObject) Open(ctx context.Context, span *objectio.Span) (io.ReadCl
 	if end <= start {
 		return nil, source.ErrRangeNotSatisfiable
 	}
-	ctx = source.WithRequestHeaders(ctx, headers)
-	return o.src.OpenRange(ctx, key, start, end, meta)
+	return origin.OpenRange(ctx, start, end)
 }
 
 func (o *sourceObject) String() string {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	return o.key
-}
-
-func cloneHeaderMap(headers map[string][]string) map[string][]string {
-	if len(headers) == 0 {
-		return nil
-	}
-	cloned := make(map[string][]string, len(headers))
-	for key, values := range headers {
-		cloned[key] = append([]string(nil), values...)
-	}
-	return cloned
+	return "origin object"
 }
 
 var _ objectio.Object = (*sourceObject)(nil)

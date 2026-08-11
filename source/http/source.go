@@ -1,4 +1,4 @@
-// Package httpsource implements source.Source using HTTP range requests.
+// Package httpsource resolves source objects using HTTP range requests.
 package httpsource
 
 import (
@@ -20,6 +20,15 @@ type Source struct {
 	Client  *http.Client
 	Resolve Resolver
 	Header  http.Header
+}
+
+// Object is one HTTP origin object with metadata and request headers captured
+// when Source.Open resolved it.
+type Object struct {
+	source   *Source
+	upstream string
+	meta     source.Metadata
+	headers  map[string][]string
 }
 
 // New constructs an HTTP source. A nil client uses http.DefaultClient.
@@ -80,23 +89,34 @@ func clearClientRepresentationConditions(req *http.Request) {
 	}
 }
 
-// Stat obtains size and validators for key. HEAD is preferred, with a
-// bytes=0-0 GET fallback for servers which do not implement useful HEADs.
-func (s *Source) Stat(ctx context.Context, key string) (source.Metadata, error) {
+// Open resolves key and obtains its immutable metadata. HEAD is preferred,
+// with a bytes=0-0 GET fallback for servers without useful HEAD responses.
+func (s *Source) Open(ctx context.Context, key string) (source.Object, error) {
 	upstream, err := s.resolve(ctx, key)
 	if err != nil {
-		return source.Metadata{}, err
+		return nil, err
 	}
 
 	meta, fallback, err := s.statHEAD(ctx, upstream)
 	if err != nil {
-		return source.Metadata{}, err
+		return nil, err
 	}
-	if !fallback {
-		return meta, nil
+	if fallback {
+		meta, err = s.statRange(ctx, upstream)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return s.statRange(ctx, upstream)
+	return &Object{
+		source:   s,
+		upstream: upstream,
+		meta:     meta,
+		headers:  cloneHeaders(source.RequestHeaders(ctx)),
+	}, nil
 }
+
+// Metadata returns the metadata captured when the object was opened.
+func (o *Object) Metadata() source.Metadata { return o.meta }
 
 func (s *Source) statHEAD(ctx context.Context, upstream string) (meta source.Metadata, fallback bool, err error) {
 	req, err := s.request(ctx, http.MethodHead, upstream)
@@ -164,8 +184,10 @@ func (s *Source) statRange(ctx context.Context, upstream string) (source.Metadat
 }
 
 // OpenRange opens exactly the half-open range [start, end). The response is
-// rejected if the upstream no longer matches expected metadata.
-func (s *Source) OpenRange(ctx context.Context, key string, start, end int64, expected source.Metadata) (io.ReadCloser, error) {
+// rejected if the upstream no longer matches the object's metadata.
+func (o *Object) OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error) {
+	s := o.source
+	expected := o.meta
 	if start < 0 || end <= start {
 		return nil, fmt.Errorf("http source: invalid range [%d,%d)", start, end)
 	}
@@ -173,11 +195,8 @@ func (s *Source) OpenRange(ctx context.Context, key string, start, end int64, ex
 		return nil, fmt.Errorf("%w: [%d,%d) exceeds size %d", source.ErrRangeNotSatisfiable, start, end, expected.Size)
 	}
 
-	upstream, err := s.resolve(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	req, err := s.request(ctx, http.MethodGet, upstream)
+	ctx = source.WithRequestHeaders(ctx, o.headers)
+	req, err := s.request(ctx, http.MethodGet, o.upstream)
 	if err != nil {
 		return nil, fmt.Errorf("http source: create range request: %w", err)
 	}
@@ -238,6 +257,17 @@ func (s *Source) OpenRange(ctx context.Context, key string, start, end int64, ex
 	return resp.Body, nil
 }
 
+func cloneHeaders(headers map[string][]string) map[string][]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	cloned := make(map[string][]string, len(headers))
+	for key, values := range headers {
+		cloned[key] = append([]string(nil), values...)
+	}
+	return cloned
+}
+
 func metadataFromResponse(resp *http.Response, size int64) source.Metadata {
 	meta := source.Metadata{
 		Size:        size,
@@ -293,3 +323,4 @@ func parseUnsatisfiedSize(value string) (int64, bool) {
 }
 
 var _ source.Source = (*Source)(nil)
+var _ source.Object = (*Object)(nil)

@@ -16,6 +16,10 @@ func resolverFor(server *httptest.Server) Resolver {
 	return func(context.Context, string) (string, error) { return server.URL + "/object", nil }
 }
 
+func objectForTest(s *Source, server *httptest.Server, meta source.Metadata) *Object {
+	return &Object{source: s, upstream: server.URL + "/object", meta: meta}
+}
+
 func TestStatHEAD(t *testing.T) {
 	modified := time.Date(2026, time.August, 9, 8, 30, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,10 +35,11 @@ func TestStatHEAD(t *testing.T) {
 	defer server.Close()
 
 	s := New(server.Client(), resolverFor(server))
-	meta, err := s.Stat(context.Background(), "movie")
+	object, err := s.Open(context.Background(), "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
+	meta := object.Metadata()
 	if meta.Size != 123 || meta.ETag != `"v1"` || meta.ContentType != "video/mp4" || !meta.LastModified.Equal(modified) {
 		t.Fatalf("unexpected metadata: %+v", meta)
 	}
@@ -63,10 +68,11 @@ func TestStatFallsBackToRangeGET(t *testing.T) {
 	defer server.Close()
 
 	s := New(server.Client(), resolverFor(server))
-	meta, err := s.Stat(context.Background(), "movie")
+	object, err := s.Open(context.Background(), "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
+	meta := object.Metadata()
 	if gets != 1 || meta.Size != 5 || meta.ETag != `"fallback"` {
 		t.Fatalf("gets=%d metadata=%+v", gets, meta)
 	}
@@ -83,10 +89,11 @@ func TestStatEmptyObjectFrom416(t *testing.T) {
 	}))
 	defer server.Close()
 
-	meta, err := New(server.Client(), resolverFor(server)).Stat(context.Background(), "empty")
+	object, err := New(server.Client(), resolverFor(server)).Open(context.Background(), "empty")
 	if err != nil {
 		t.Fatal(err)
 	}
+	meta := object.Metadata()
 	if meta.Size != 0 {
 		t.Fatalf("size = %d, want 0", meta.Size)
 	}
@@ -113,7 +120,7 @@ func TestOpenRangeValidatesAndUsesIfRange(t *testing.T) {
 
 	s := New(server.Client(), resolverFor(server))
 	s.Header = http.Header{"Authorization": {"Bearer secret"}}
-	rc, err := s.OpenRange(context.Background(), "movie", 2, 6, source.Metadata{Size: 10, ETag: `"v1"`})
+	rc, err := objectForTest(s, server, source.Metadata{Size: 10, ETag: `"v1"`}).OpenRange(context.Background(), 2, 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,11 +147,12 @@ func TestOpenRangeUsesLastModifiedForWeakETag(t *testing.T) {
 	}))
 	defer server.Close()
 
-	rc, err := New(server.Client(), resolverFor(server)).OpenRange(context.Background(), "x", 0, 1, source.Metadata{
+	s := New(server.Client(), resolverFor(server))
+	rc, err := objectForTest(s, server, source.Metadata{
 		Size:         1,
 		ETag:         `W/"weak"`,
 		LastModified: modified,
-	})
+	}).OpenRange(context.Background(), 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +167,8 @@ func TestOpenRangeDetectsObjectChange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.Client(), resolverFor(server)).OpenRange(context.Background(), "movie", 2, 6, source.Metadata{Size: 10, ETag: `"old"`})
+	s := New(server.Client(), resolverFor(server))
+	_, err := objectForTest(s, server, source.Metadata{Size: 10, ETag: `"old"`}).OpenRange(context.Background(), 2, 6)
 	if !errors.Is(err, source.ErrObjectChanged) {
 		t.Fatalf("error = %v, want ErrObjectChanged", err)
 	}
@@ -174,7 +183,8 @@ func TestOpenRangeRejectsBadContentRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.Client(), resolverFor(server)).OpenRange(context.Background(), "movie", 2, 6, source.Metadata{Size: 10})
+	s := New(server.Client(), resolverFor(server))
+	_, err := objectForTest(s, server, source.Metadata{Size: 10}).OpenRange(context.Background(), 2, 6)
 	if err == nil {
 		t.Fatal("expected Content-Range validation error")
 	}
@@ -188,7 +198,8 @@ func TestOpenRangeReportsUnsupportedRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.Client(), resolverFor(server)).OpenRange(context.Background(), "movie", 2, 6, source.Metadata{Size: 10})
+	s := New(server.Client(), resolverFor(server))
+	_, err := objectForTest(s, server, source.Metadata{Size: 10}).OpenRange(context.Background(), 2, 6)
 	if !errors.Is(err, source.ErrRangeUnsupported) {
 		t.Fatalf("error = %v, want ErrRangeUnsupported", err)
 	}
@@ -200,7 +211,7 @@ func TestStatNotFound(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.Client(), resolverFor(server)).Stat(context.Background(), "missing")
+	_, err := New(server.Client(), resolverFor(server)).Open(context.Background(), "missing")
 	if !errors.Is(err, source.ErrNotFound) {
 		t.Fatalf("error = %v, want ErrNotFound", err)
 	}
@@ -218,10 +229,11 @@ func TestOpenRangeDetectsLastModifiedChange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.Client(), resolverFor(server)).OpenRange(context.Background(), "x", 0, 1, source.Metadata{
+	s := New(server.Client(), resolverFor(server))
+	_, err := objectForTest(s, server, source.Metadata{
 		Size:         1,
 		LastModified: expectedTime,
-	})
+	}).OpenRange(context.Background(), 0, 1)
 	if !errors.Is(err, source.ErrObjectChanged) {
 		t.Fatalf("error = %v, want ErrObjectChanged", err)
 	}
@@ -282,11 +294,11 @@ func TestRequestHeadersForwardedAndCacheRangeHeadersOverrideClientValues(t *test
 		"Host":          {"client.example"},
 	})
 	s := New(server.Client(), resolverFor(server))
-	meta, err := s.Stat(ctx, "movie")
+	object, err := s.Open(ctx, "movie")
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := s.OpenRange(ctx, "movie", 2, 6, meta)
+	rc, err := object.OpenRange(context.Background(), 2, 6)
 	if err != nil {
 		t.Fatal(err)
 	}

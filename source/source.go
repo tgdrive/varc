@@ -1,4 +1,4 @@
-// Package source defines the remote object interface consumed by the cache.
+// Package source defines origin objects consumed by the cache.
 package source
 
 import (
@@ -27,12 +27,17 @@ type Metadata struct {
 	ContentType  string
 }
 
-// Source provides metadata and half-open ranged reads [start, end).
-//
-// Implementations must return exactly the requested range from OpenRange or an
-// error. expected is the metadata previously returned by Stat and should be
-// used to prevent mixing bytes from different object versions when possible.
+// Object is one immutable origin object. Implementations must return exactly
+// the requested half-open range [start, end) from OpenRange or an error.
+// Metadata validators should be used to prevent bytes from different object
+// versions from being mixed.
+type Object interface {
+	Metadata() Metadata
+	OpenRange(ctx context.Context, start, end int64) (io.ReadCloser, error)
+}
+
+// Source resolves object keys. It is used by integrations such as HTTP
+// proxies; the cache itself accepts an Object directly.
 type Source interface {
-	Stat(ctx context.Context, key string) (Metadata, error)
-	OpenRange(ctx context.Context, key string, start, end int64, expected Metadata) (io.ReadCloser, error)
+	Open(ctx context.Context, key string) (Object, error)
 }

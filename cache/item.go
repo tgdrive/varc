@@ -72,7 +72,7 @@ func (item *Item) createDownloadersLocked() {
 	item.downloaders = scheduler.New(item.c.ctx, item, opt, item.key, item.object)
 }
 
-func (item *Item) openLocked(ctx context.Context, sourceKey string, meta source.Metadata) error {
+func (item *Item) openLocked(origin source.Object, meta source.Metadata) error {
 	for item.closing != nil {
 		closing := item.closing
 		item.mu.Unlock()
@@ -131,9 +131,9 @@ func (item *Item) openLocked(ctx context.Context, sourceKey string, meta source.
 	}
 
 	if item.object == nil {
-		item.object = &sourceObject{src: item.c.src}
+		item.object = &sourceObject{}
 	}
-	item.object.updateRequest(sourceKey, meta, source.RequestHeaders(ctx))
+	item.object.update(origin, meta)
 	item.meta = meta
 	item.info.Key = item.key
 	item.info.Size = meta.Size
@@ -541,6 +541,24 @@ type Reader struct {
 	ctx  context.Context
 	item *Item
 	meta source.Metadata
+
+	mu  sync.Mutex
+	off int64
+}
+
+// Read implements io.Reader using a per-reader offset starting at zero.
+func (r *Reader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.off >= r.meta.Size {
+		return 0, io.EOF
+	}
+	n, err := r.item.readAt(r.ctx, p, r.off)
+	r.off += int64(n)
+	return n, err
 }
 
 // ReadAt implements io.ReaderAt using the context supplied to Cache.Open.
@@ -566,4 +584,5 @@ func (r *Reader) Close() error {
 }
 
 var _ io.ReaderAt = (*Reader)(nil)
+var _ io.Reader = (*Reader)(nil)
 var _ io.Closer = (*Reader)(nil)
