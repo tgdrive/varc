@@ -199,6 +199,7 @@ func (dls *Downloaders) _removeClosed() {
 }
 
 func (dls *Downloaders) Close(inErr error) (err error) {
+	dls.cancel()
 	dls.mu.Lock()
 	defer dls.mu.Unlock()
 	dls._removeClosed()
@@ -206,11 +207,10 @@ func (dls *Downloaders) Close(inErr error) (err error) {
 		dls.mu.Unlock()
 		closeErr := dl.stopAndClose(inErr)
 		dls.mu.Lock()
-		if closeErr != nil && err != nil {
+		if closeErr != nil && err == nil {
 			err = closeErr
 		}
 	}
-	dls.cancel()
 	dls.mu.Unlock()
 	dls.wg.Wait()
 	dls.mu.Lock()

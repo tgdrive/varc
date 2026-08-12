@@ -55,6 +55,34 @@ type downloaderTestObject struct {
 	open int
 }
 
+type cancelBlockingObject struct {
+	started chan struct{}
+	size    int64
+}
+
+func (o *cancelBlockingObject) Size() int64 { return o.size }
+
+func (o *cancelBlockingObject) Open(ctx context.Context, _ *objectio.Span) (io.ReadCloser, error) {
+	return &cancelBlockingReader{ctx: ctx, started: o.started}, nil
+}
+
+type cancelBlockingReader struct {
+	ctx     context.Context
+	started chan struct{}
+}
+
+func (r *cancelBlockingReader) Read([]byte) (int, error) {
+	select {
+	case <-r.started:
+	default:
+		close(r.started)
+	}
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func (*cancelBlockingReader) Close() error { return nil }
+
 func (o *downloaderTestObject) Size() int64 { return int64(len(o.data)) }
 
 func (o *downloaderTestObject) Open(_ context.Context, span *objectio.Span) (io.ReadCloser, error) {
@@ -138,5 +166,36 @@ func TestDownloadAndEnsureDownloader(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsParallelDownloaderBeforeStoppingBuffer(t *testing.T) {
+	ctx := objectio.WithConfig(context.Background(), objectio.Config{BufferSize: 4 * 1024 * 1024, LowLevelRetries: 1})
+	object := &cancelBlockingObject{started: make(chan struct{}), size: 8 * 1024 * 1024}
+	item := &downloaderTestItem{size: object.Size()}
+	dls := New(ctx, item, &Config{ChunkSize: 1024 * 1024, ChunkSizeLimit: 1024 * 1024, ChunkStreams: 2}, "object", object)
+
+	downloadResult := make(chan error, 1)
+	go func() {
+		downloadResult <- dls.Download(ranges.Range{Pos: 0, Size: 32 * 1024})
+	}()
+	select {
+	case <-object.started:
+	case <-time.After(time.Second):
+		t.Fatal("parallel downloader did not start")
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- dls.Close(nil) }()
+	select {
+	case <-closeResult:
+	case <-time.After(time.Second):
+		t.Fatal("Close remained blocked in StopBuffering")
+	}
+	select {
+	case <-downloadResult:
+	case <-time.After(time.Second):
+		t.Fatal("Download remained blocked after Close")
+	}
+}
+
 var _ Item = (*downloaderTestItem)(nil)
 var _ objectio.Object = (*downloaderTestObject)(nil)
+var _ objectio.Object = (*cancelBlockingObject)(nil)

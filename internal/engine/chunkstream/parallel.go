@@ -77,6 +77,9 @@ func (s *stream) read(p []byte) (n int, err error) {
 			break
 		}
 		s.rw.WaitWrite(s.ctx)
+		if err := s.ctx.Err(); err != nil {
+			return n, err
+		}
 	}
 	return n, nil
 }
